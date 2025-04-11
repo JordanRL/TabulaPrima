@@ -64,7 +64,7 @@ MLA_LATENT_DIM = 288
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 2048
 VOCAB_SIZE = 50257  # GPT-2 tokenizer vocab size
-BATCH_SIZE = 4
+BATCH_SIZE = 2
 GRAD_STEPS = 4
 LEARNING_RATE = 3e-4
 
@@ -450,11 +450,42 @@ class MLATransformer(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
 
-        # Tie weights
+        # Apply custom initialization
+        self.apply(self._init_weights)
+
+        # Specifically tune positional embeddings
+        nn.init.normal_(self.pos_embedding, mean=0.0, std=0.01)
+
+        # Tie weights (after initialization)
         self.lm_head.weight = self.embedding.weight
 
         # Flag for generation optimization
         self.generation_ready = False
+
+    def _init_weights(self, module):
+        """Initialize the weights - critical for stable training"""
+        if isinstance(module, nn.Linear):
+            # Initialize linear layers with small random values
+            # Using a Kaiming normal distribution suitable for GELU activation
+            torch.nn.init.kaiming_normal_(module.weight, a=0.01, mode='fan_in', nonlinearity='leaky_relu')
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            # Initialize embeddings with small normal distribution
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            # Initialize LayerNorm with ones and zeros
+            torch.nn.init.ones_(module.weight)
+            torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, MultiHeadLatentAttention):
+            # Special initialization for attention matrices
+            for name, param in module.named_parameters():
+                if 'weight' in name:
+                    # Attention weights need careful initialization
+                    # Scale by head dimension
+                    torch.nn.init.normal_(param, mean=0.0, std=0.02 / math.sqrt(HIDDEN_DIM // NUM_HEADS))
+                elif 'bias' in name and param is not None:
+                    torch.nn.init.zeros_(param)
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False):
         batch_size, seq_len = input_ids.shape
@@ -929,11 +960,38 @@ def train(
             if use_amp:
                 with torch.amp.autocast('cuda'):
                     logits = model(input_ids, attention_mask=attention_mask, use_cache=False)
-                    loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        labels.view(-1),
-                        ignore_index=-100
-                    )
+
+                    # Shift logits and labels for next token prediction
+                    shifted_logits = logits[:, :-1, :].contiguous()
+                    shifted_labels = labels[:, 1:].contiguous()
+
+                    # Flatten the tensors
+                    vocab_size = shifted_logits.size(-1)
+                    flat_logits = shifted_logits.view(-1, vocab_size)
+                    flat_labels = shifted_labels.view(-1)
+
+                    # Create a mask tensor from the comparison
+                    comparison_result = flat_labels != -100
+                    valid_mask = torch.zeros_like(flat_labels, dtype=torch.bool)
+                    valid_mask = valid_mask | comparison_result  # Explicit conversion to boolean tensor
+                    valid_count = valid_mask.sum().item()
+
+                    if valid_count > 0:
+                        # Get only the logits and labels at valid positions
+                        masked_logits = flat_logits[valid_mask]
+                        masked_labels = flat_labels[valid_mask]
+
+                        # Calculate loss only on valid positions
+                        loss = F.cross_entropy(
+                            masked_logits,
+                            masked_labels,
+                            reduction='mean'
+                        )
+                    else:
+                        # Fallback if no valid positions
+                        loss = torch.tensor(0.0, device=device)
+
+                    # Scale for gradient accumulation
                     loss = loss / gradient_accumulation_steps
 
                 # Backward pass with gradient scaling
@@ -948,17 +1006,29 @@ def train(
                 loss = loss / gradient_accumulation_steps
                 loss.backward()
 
+            if loss.item() > 100:
+                print(Colors.warning(f"\n Extremely high loss detected: {loss.item():.2f}. Check model initialization."))
+                progress_bar.close()
+                return total_tokens, "failed"
+
+            # Early in training, clip loss for stability
+            if optimizer_steps < 10:
+                loss = torch.clamp(loss, max=20.0)
+
+            # 3. More aggressive gradient clipping for initial steps
+            grad_clip_value = 0.5 if optimizer_steps < 10 else max_grad_norm
+
             # Update weights after accumulating gradients
             if inference_steps % gradient_accumulation_steps == 0:
                 optimizer_steps += 1
                 steps_since_instrument += 1
                 if use_amp:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
                     optimizer.step()
 
                 scheduler.step()
@@ -1066,7 +1136,7 @@ def train(
             progress_bar.close()
             break
 
-    return total_tokens
+    return total_tokens, "success"
 
 def save_checkpoint(model, optimizer, scheduler, checkpoint_dir):
     print(Colors.header(f"\n{'-' * 40}"))
@@ -1608,7 +1678,7 @@ def main():
     try:
         if run_status == "setup":
             run_status = "training"
-            trained_tokens = train(
+            trained_tokens, run_status = train(
                 model=model,
                 train_dataloader=train_dataloader,
                 test_dataloader=test_dataloader,
@@ -1621,7 +1691,8 @@ def main():
                 eval_interval=eval_interval,
                 global_steps=total_steps,
             )
-            run_status = "success"
+            if run_status == "failed":
+                wandb.run.status = run_status
         else:
             print(Colors.warning(f"\n  🚫 Training skipped due to previous error"))
     except KeyboardInterrupt:
