@@ -393,6 +393,7 @@ class TransformerLayer(nn.Module):
         # First sublayer: MLA with residual connection
         # Pass the normalized input and attention mask to MLA
         normalized_x = self.norm1(x)
+        present_key_value = None
 
         # Pass through attention layer with caching support
         if use_cache:
@@ -743,6 +744,7 @@ class CachedHFDataset(Dataset):
 
         # Try to load from cache first
         self.examples = self._load_from_cache()
+        was_cached = self._was_cached()
 
         # If not in cache, process the dataset and save to cache
         if self.examples is None:
@@ -808,7 +810,7 @@ class CachedHFDataset(Dataset):
             print(f"  • Total tokens: {self.total_tokens:,}")
             print(f"  • Avg tokens per example: {self.total_tokens / max(1, len(self.examples)):.1f}")
         print(f"  • Sequence length: {seq_length}")
-        if self._was_cached():
+        if was_cached:
             print(f"  • Loaded from cache: Yes ✓")
         else:
             print(f"  • Saved to cache: Yes ✓")
@@ -926,7 +928,7 @@ def train(
             # Forward pass with mixed precision
             if use_amp:
                 with torch.amp.autocast('cuda'):
-                    logits = model(input_ids, attention_mask=attention_mask, use_cache=True)
+                    logits = model(input_ids, attention_mask=attention_mask, use_cache=False)
                     loss = F.cross_entropy(
                         logits.view(-1, logits.size(-1)),
                         labels.view(-1),
@@ -937,7 +939,7 @@ def train(
                 # Backward pass with gradient scaling
                 scaler.scale(loss).backward()
             else:
-                logits = model(input_ids, attention_mask=attention_mask, use_cache=True)
+                logits = model(input_ids, attention_mask=attention_mask, use_cache=False)
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
@@ -988,7 +990,7 @@ def train(
 
             # Calculate current perplexity (exp of loss)
             current_loss = sum(loss_window) / len(loss_window)
-            current_perplexity = math.exp(current_loss)
+            current_perplexity = math.exp(current_loss) if len(loss_window) > 1 else float('inf')
 
             # Update progress bar
             progress_bar.set_postfix({
@@ -998,7 +1000,7 @@ def train(
                 "lr": f"{scheduler.get_last_lr()[0]:.6f}"
             })
 
-            if steps_since_instrument == log_interval or optimizer_steps % eval_interval_steps == 0:
+            if (steps_since_instrument == log_interval or optimizer_steps % eval_interval_steps == 0) and steps_since_instrument > 0 and optimizer_steps > 0:
                 # Calculate gradient norm
                 grad_norm = 0.0
                 for param in model.parameters():
@@ -1019,7 +1021,7 @@ def train(
                 log_loss = 0
                 steps_since_instrument = 0
 
-            if optimizer_steps % eval_interval_steps == 0:
+            if optimizer_steps % eval_interval_steps == 0 and optimizer_steps > 0:
                 print(Colors.header(f"\n{'-' * 40}"))
                 print(Colors.header(f" Evaluating model performance on test dataset"))
                 print(Colors.header(f"{'-' * 40}"))
@@ -1109,14 +1111,14 @@ def evaluate(model, dataloader, device, use_amp=True):
 
             if use_amp:
                 with torch.amp.autocast('cuda'):
-                    logits = model(input_ids, attention_mask=attention_mask)
+                    logits = model(input_ids, attention_mask=attention_mask, use_cache=False)
                     loss = F.cross_entropy(
                         logits.view(-1, logits.size(-1)),
                         labels.view(-1),
                         ignore_index=-100
                     )
             else:
-                logits = model(input_ids, attention_mask=attention_mask)
+                logits = model(input_ids, attention_mask=attention_mask, use_cache=False)
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
@@ -1126,15 +1128,46 @@ def evaluate(model, dataloader, device, use_amp=True):
             # Calculate accuracy
             flat_logits = logits.view(-1, logits.size(-1))
             flat_labels = labels.view(-1)
-            
-            # Find indices where labels are not -100 (padding)
-            valid_indices = flat_labels != -100
-            
-            if valid_indices.sum() > 0:
-                predictions = flat_logits[valid_indices].argmax(dim=-1)
-                correct = predictions.eq(flat_labels[valid_indices])
-                total_correct += correct.sum().item()
-                total_tokens += valid_indices.sum().item()
+
+            # Create a mask tensor from the comparison
+            comparison_result = flat_labels != -100
+            valid_mask = torch.zeros_like(flat_labels, dtype=torch.bool)
+            valid_mask = valid_mask | comparison_result  # Explicit conversion to boolean tensor
+
+            # Count valid tokens
+            valid_count = int(torch.sum(valid_mask).item())  # Convert to Python int for clarity
+
+            if valid_count > 0:
+                # Get logits and use argmax to find predictions
+                masked_logits = torch.zeros(
+                    (valid_count, flat_logits.size(-1)),
+                    device=flat_logits.device,
+                    dtype=flat_logits.dtype
+                )
+
+                # Fill in values for valid positions
+                valid_counter = 0
+                for i in range(len(flat_labels)):
+                    if valid_mask[i]:
+                        masked_logits[valid_counter] = flat_logits[i]
+                        valid_counter += 1
+
+                # Now get predictions
+                predictions = masked_logits.argmax(dim=-1)
+
+                # Extract valid labels into a new tensor
+                valid_labels = torch.zeros(valid_count, device=flat_labels.device, dtype=flat_labels.dtype)
+                valid_counter = 0
+                for i in range(len(flat_labels)):
+                    if valid_mask[i]:
+                        valid_labels[valid_counter] = flat_labels[i]
+                        valid_counter += 1
+
+                # Check which predictions are correct
+                correct = (predictions == valid_labels)
+
+                total_correct += int(torch.sum(correct).item())
+                total_tokens += valid_count
             
             total_loss += loss.item()
 
@@ -1551,7 +1584,7 @@ def main():
                     "gradient_accumulation_steps": args.grad_acc_steps,
                     "optimizer": "Adam8Bit" if "8bit" in optimizer.__class__.__name__ else "AdamW",
                 },
-                name=args.dataset+"_"+datetime.datetime.now().strftime("%Y%m%d_%H%M"),
+                name=args.run_name+"_"+datetime.datetime.now().strftime("%Y%m%d_%H%M"),
             )
             """
             wandb.watch(
