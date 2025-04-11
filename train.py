@@ -62,11 +62,11 @@ HEAD_DIM = HIDDEN_DIM // NUM_HEADS
 FF_DIM = 4608
 MLA_LATENT_DIM = 288
 DROPOUT = 0.1
-MAX_SEQ_LENGTH = 1024
+MAX_SEQ_LENGTH = 512
 VOCAB_SIZE = 50257  # GPT-2 tokenizer vocab size
 BATCH_SIZE = 1
 GRAD_STEPS = 8
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 5e-5
 
 
 def parse_args():
@@ -93,31 +93,46 @@ def parse_args():
 
     return parser.parse_args()
 
-# Memory-efficient Rotary Position Embedding (RoPE)
+
+# More stable RoPE implementation that still preserves partial application
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=MAX_SEQ_LENGTH):
         super().__init__()
+        # Initialize frequency bands - this is standard in RoPE implementations
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
+
+        # Pre-compute embeddings for efficiency (optional, but improves stability)
+        t = torch.arange(max_seq_len, dtype=torch.float)
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        # Pre-compute and cache with broadcasting dimensions
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().unsqueeze(0).unsqueeze(0)  # [1, 1, seq, dim]
+        sin = emb.sin().unsqueeze(0).unsqueeze(0)  # [1, 1, seq, dim]
+
+        self.register_buffer("cos_cached", cos)
+        self.register_buffer("sin_cached", sin)
         self.max_seq_len = max_seq_len
 
     def forward(self, x, seq_len=None):
+        """
+        Get rotary embeddings for the given sequence length.
+
+        Args:
+            x: Input tensor, only used to determine device if needed
+            seq_len: Sequence length to return embeddings for
+
+        Returns:
+            Tuple of (cos, sin) embeddings with shape [1, 1, seq_len, dim]
+        """
         if seq_len > self.max_seq_len:
             raise ValueError(f"Sequence length ({seq_len}) exceeds maximum length ({self.max_seq_len})")
 
-        # Cached RoPE to save memory and computation
-        if seq_len != self.seq_len_cached:
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.einsum('i,j->ij', t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-            self.cos_cached = emb.cos()[None, None, :, :]
-            self.sin_cached = emb.sin()[None, None, :, :]
-
-        return self.cos_cached, self.sin_cached
+        # Return the pre-computed values, sliced to the needed length
+        return (
+            self.cos_cached[:, :, :seq_len, :],
+            self.sin_cached[:, :, :seq_len, :]
+        )
 
 def rotate_half(x):
     x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
@@ -213,27 +228,24 @@ class MultiHeadLatentAttention(nn.Module):
         cos_slice = cos[:, :, q_r_pos_slice]
         sin_slice = sin[:, :, q_r_pos_slice]
 
-        # Apply RoPE only to the dedicated RoPE part
-        # Handle shape for broadcasting
-        # cos_slice and sin_slice should be [1, 1, seq_len, rope_dim]
-        # We need to reshape for broadcasting with q_r [batch, seq_len, num_heads, rope_dim]
+        # Apply rotation to each dimension pair in q_r
+        x1, x2 = q_r[..., ::2], q_r[..., 1::2]
+        q_r_rotated = torch.zeros_like(q_r)
 
-        # Add any needed dimensions to make shapes compatible
-        if cos_slice.dim() < 4:
-            cos_slice = cos_slice.unsqueeze(0).unsqueeze(0)
-        if sin_slice.dim() < 4:
-            sin_slice = sin_slice.unsqueeze(0).unsqueeze(0)
+        # Get properly shaped cos/sin slices
+        cos_view = cos_slice.view(1, 1, seq_len, self.rope_dim // 2)
+        sin_view = sin_slice.view(1, 1, seq_len, self.rope_dim // 2)
 
-        # Ensure proper dimensions for broadcasting
-        cos_slice = cos_slice.view(1, 1, cos_slice.size(-2), cos_slice.size(-1))
-        sin_slice = sin_slice.view(1, 1, sin_slice.size(-2), sin_slice.size(-1))
+        # Expand to match dimensions
+        cos_expanded = cos_view.expand(batch_size, self.num_heads, -1, -1)
+        sin_expanded = sin_view.expand(batch_size, self.num_heads, -1, -1)
 
-        # Expand to match batch and heads
-        cos_slice = cos_slice.expand(batch_size, self.num_heads, -1, -1).transpose(1, 2)
-        sin_slice = sin_slice.expand(batch_size, self.num_heads, -1, -1).transpose(1, 2)
+        # Apply rotation
+        q_r_rotated[..., ::2] = x1 * cos_expanded - x2 * sin_expanded
+        q_r_rotated[..., 1::2] = x1 * sin_expanded + x2 * cos_expanded
 
-        # Apply RoPE to query RoPE part
-        q_r = (q_r * cos_slice) + (rotate_half(q_r) * sin_slice)
+        # Replace q_r with rotated version
+        q_r = q_r_rotated
 
         # === KEY-VALUE PATH ===
         # Create latent representation for KV
@@ -248,9 +260,20 @@ class MultiHeadLatentAttention(nn.Module):
         k_r_cur = self.k_rope_proj(x)
         k_r_cur = k_r_cur.view(batch_size, seq_len, 1, self.rope_dim)
 
-        # Apply RoPE to key RoPE part
-        k_r_cur = (k_r_cur * cos_slice[:, :, :, :self.rope_dim]) + (
-                    rotate_half(k_r_cur) * sin_slice[:, :, :, :self.rope_dim])
+        # Apply rotation to each dimension pair in k_r_cur
+        x1, x2 = k_r_cur[..., ::2], k_r_cur[..., 1::2]
+        k_r_cur_rotated = torch.zeros_like(k_r_cur)
+
+        # Get properly shaped cos/sin slices for key
+        cos_view_k = cos_slice.view(1, 1, seq_len, self.rope_dim // 2)
+        sin_view_k = sin_slice.view(1, 1, seq_len, self.rope_dim // 2)
+
+        # Apply rotation
+        k_r_cur_rotated[..., ::2] = x1 * cos_view_k - x2 * sin_view_k
+        k_r_cur_rotated[..., 1::2] = x1 * sin_view_k + x2 * cos_view_k
+
+        # Replace k_r_cur with rotated version
+        k_r_cur = k_r_cur_rotated
 
         # === CACHE HANDLING ===
         if past_key_value is not None:
@@ -439,7 +462,6 @@ class MLATransformer(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len, hidden_dim))
 
         # Use torch.nn.ModuleList for better memory efficiency with checkpoint
         self.layers = nn.ModuleList([
@@ -452,9 +474,6 @@ class MLATransformer(nn.Module):
 
         # Apply custom initialization
         self.apply(self._init_weights)
-
-        # Specifically tune positional embeddings
-        nn.init.normal_(self.pos_embedding, mean=0.0, std=0.01)
 
         # Tie weights (after initialization)
         self.lm_head.weight = self.embedding.weight
@@ -492,15 +511,6 @@ class MLATransformer(nn.Module):
 
         # Embed tokens and positions
         x = self.embedding(input_ids)
-
-        # Add positional embeddings - adjust for partial positions in generation
-        position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
-        if past_key_values is not None:
-            # Adjust position IDs for generation
-            position_ids = position_ids + past_key_values[0][2]  # Add past length
-
-        # Add positional embeddings
-        x = x + self.pos_embedding[:, position_ids, :]
 
         # Process with attention and KV cache
         present_key_values = [] if use_cache else None
@@ -1725,45 +1735,47 @@ def main():
             total_tokens = 0
             avg_tokens_per_second = 0
             tokens_per_parameter = 0
-            
-        # Log comprehensive run summary
-        wandb.log({
-            # Timing information
-            "run/total_time_seconds": total_training_time,
-            "run/total_time_hours": total_training_hours,
-            "run/tokens_per_second_avg": avg_tokens_per_second,
-            
-            # Model information
-            "run/model_parameters": sum(p.numel() for p in model.parameters()),
-            "run/model_parameter_groups": len(list(model.parameters())),
-            "run/tokens_per_parameter": tokens_per_parameter,
-            
-            # Dataset information
-            "run/total_tokens_processed": total_tokens,
-            "run/dataset_size_tokens": train_dataset.total_tokens if hasattr(train_dataset, "total_tokens") else 0,
-            "run/dataset_size_examples": len(train_dataset),
-            
-            # Hardware information
-            "run/gpu_name": gpu_name,
-            "run/gpu_memory_gb": memory_gb,
-            "run/gpu_utilization_pct": gpu_utilization,
-            "run/memory_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0,
-            "run/memory_reserved_gb": torch.cuda.memory_reserved(device) / (1024 ** 3) if torch.cuda.is_available() else 0,
-        })
-        
-        # Create a final summary table
+
         if wandb.run is not None:
-            columns = ["Metric", "Value"]
-            data = [
-                ["Total Training Time", f"{total_training_hours:.2f} hours"],
-                ["Average Tokens/Second", f"{avg_tokens_per_second:.2f}"],
-                ["Total Tokens Processed", f"{total_tokens:,}"],
-                ["Model Parameters", f"{sum(p.numel() for p in model.parameters()):,}"],
-                ["GPU Utilization", f"{gpu_utilization:.1f}%"],
-            ]
-            wandb.log({"run/summary_table": wandb.Table(columns=columns, data=data)})
-        
-        wandb.finish()
+            if model:
+                # Log comprehensive run summary
+                wandb.log({
+                    # Timing information
+                    "run/total_time_seconds": total_training_time,
+                    "run/total_time_hours": total_training_hours,
+                    "run/tokens_per_second_avg": avg_tokens_per_second,
+
+                    # Model information
+                    "run/model_parameters": sum(p.numel() for p in model.parameters()),
+                    "run/model_parameter_groups": len(list(model.parameters())),
+                    "run/tokens_per_parameter": tokens_per_parameter,
+
+                    # Dataset information
+                    "run/total_tokens_processed": total_tokens,
+                    "run/dataset_size_tokens": train_dataset.total_tokens if hasattr(train_dataset, "total_tokens") else 0,
+                    "run/dataset_size_examples": len(train_dataset),
+
+                    # Hardware information
+                    "run/gpu_name": gpu_name,
+                    "run/gpu_memory_gb": memory_gb,
+                    "run/gpu_utilization_pct": gpu_utilization,
+                    "run/memory_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0,
+                    "run/memory_reserved_gb": torch.cuda.memory_reserved(device) / (1024 ** 3) if torch.cuda.is_available() else 0,
+                })
+
+                # Create a final summary table
+                if wandb.run is not None:
+                    columns = ["Metric", "Value"]
+                    data = [
+                        ["Total Training Time", f"{total_training_hours:.2f} hours"],
+                        ["Average Tokens/Second", f"{avg_tokens_per_second:.2f}"],
+                        ["Total Tokens Processed", f"{total_tokens:,}"],
+                        ["Model Parameters", f"{sum(p.numel() for p in model.parameters()):,}"],
+                        ["GPU Utilization", f"{gpu_utilization:.1f}%"],
+                    ]
+                    wandb.log({"run/summary_table": wandb.Table(columns=columns, data=data)})
+
+            wandb.finish()
 
     print(Colors.header(f"\n{'='*50}"))
     print(Colors.header(f" Training Complete"))
