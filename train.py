@@ -62,10 +62,10 @@ HEAD_DIM = HIDDEN_DIM // NUM_HEADS
 FF_DIM = 4608
 MLA_LATENT_DIM = 288
 DROPOUT = 0.1
-MAX_SEQ_LENGTH = 2048
+MAX_SEQ_LENGTH = 1024
 VOCAB_SIZE = 50257  # GPT-2 tokenizer vocab size
-BATCH_SIZE = 2
-GRAD_STEPS = 4
+BATCH_SIZE = 1
+GRAD_STEPS = 8
 LEARNING_RATE = 3e-4
 
 
@@ -926,7 +926,6 @@ def train(
     # Tracking training dynamics
     total_tokens = 0
     target_tokens = total_parameters * 10
-    log_loss = 0
     token_window = []
     token_times = []
     loss_window = []
@@ -1018,6 +1017,13 @@ def train(
             # 3. More aggressive gradient clipping for initial steps
             grad_clip_value = 0.5 if optimizer_steps < 10 else max_grad_norm
 
+            # Calculate gradient norm
+            grad_norm = 0.0
+            for param in model.parameters():
+                if param.grad is not None:
+                    grad_norm += param.grad.data.norm(2).item() ** 2
+            grad_norm = grad_norm ** 0.5
+
             # Update weights after accumulating gradients
             if inference_steps % gradient_accumulation_steps == 0:
                 optimizer_steps += 1
@@ -1040,7 +1046,6 @@ def train(
 
             # Update tracking metrics
             total_tokens += input_ids.numel()
-            log_loss += loss.item() * gradient_accumulation_steps
 
             # Update moving window metrics
             token_window.append(input_ids.numel())
@@ -1062,13 +1067,6 @@ def train(
             current_loss = sum(loss_window) / len(loss_window)
             current_perplexity = math.exp(min(current_loss, 20)) if len(loss_window) > 1 else float('inf')
 
-            # Calculate gradient norm
-            grad_norm = 0.0
-            for param in model.parameters():
-                if param.grad is not None:
-                    grad_norm += param.grad.data.norm(2).item() ** 2
-            grad_norm = grad_norm ** 0.5
-
             # Update progress bar
             progress_bar.set_postfix({
                 "loss": f"{current_loss:.4f}",
@@ -1079,8 +1077,9 @@ def train(
             })
 
             if (steps_since_instrument == log_interval or optimizer_steps % eval_interval_steps == 0) and steps_since_instrument > 0 and optimizer_steps > 0:
-                momentary_loss = log_loss / steps_since_instrument
-                momentary_perplexity = math.exp(momentary_loss)
+                momentary_loss = current_loss
+                momentary_perplexity = current_perplexity
+                steps_since_instrument = 0
                 training_dict = {
                     "training/loss": momentary_loss,
                     "training/perplexity": momentary_perplexity,
@@ -1089,8 +1088,6 @@ def train(
                     "training/grad_norm": grad_norm,
                     "metric/progress": optimizer_steps / global_steps
                 }
-                log_loss = 0
-                steps_since_instrument = 0
 
             if optimizer_steps % eval_interval_steps == 0 and optimizer_steps > 0:
                 print(Colors.header(f"\n{'-' * 40}"))
