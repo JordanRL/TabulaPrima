@@ -357,18 +357,37 @@ class TransformerLayer(nn.Module):
         self.ff = FeedForward(hidden_dim, ff_dim, dropout)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, attention_mask=None):
+    def forward(self, x, attention_mask=None, past_key_value=None, use_cache=False):
         # First sublayer: MLA with residual connection
         # Pass the normalized input and attention mask to MLA
         normalized_x = self.norm1(x)
-        attn_output = self.attention(normalized_x, attention_mask=attention_mask)
+
+        # Pass through attention layer with caching support
+        if use_cache:
+            attn_output, present_key_value = self.attention(
+                normalized_x,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                use_cache=True
+            )
+        else:
+            attn_output = self.attention(
+                normalized_x,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                is_causal=True
+            )
+
         x = x + self.dropout(attn_output)
 
         # Second sublayer: FFN with residual connection
         ff_output = self.ff(self.norm2(x))
         x = x + self.dropout(ff_output)
 
-        return x
+        if use_cache:
+            return x, present_key_value
+        else:
+            return x
 
 
 # Full Transformer Model
@@ -658,6 +677,7 @@ class HFDataset(Dataset):
             "labels": input_ids[1:]
         }
 
+
 # Memory-efficient training function with additional optimizations for 2070 Super
 def train(
         model,
@@ -705,7 +725,7 @@ def train(
 
         eval_interval_steps = max(1, eval_interval)
 
-        for step, batch in train_dataloader:
+        for batch in train_dataloader:
             # Move batch to device
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
@@ -779,12 +799,12 @@ def train(
             progress_bar.update(input_ids.numel())
 
             # Calculate tokens per second
-            tokens_per_sec = sum(token_window) / token_times[-1:] - token_times[0]
+            tokens_per_sec = sum(token_window) / (token_times[-1] - token_times[0]) if len(token_times) > 1 else 1
 
             # Calculate current perplexity (exp of loss)
             current_loss = sum(loss_window) / len(loss_window)
             current_perplexity = math.exp(current_loss)
-            
+
             # Update progress bar
             progress_bar.set_postfix({
                 "loss": f"{current_loss:.4f}",
@@ -815,9 +835,9 @@ def train(
                 steps_since_instrument = 0
 
             if optimizer_steps % eval_interval_steps == 0:
-                print(Colors.header(f"\n{'-'*40}"))
+                print(Colors.header(f"\n{'-' * 40}"))
                 print(Colors.header(f" Evaluating model performance on test dataset"))
-                print(Colors.header(f"{'-'*40}"))
+                print(Colors.header(f"{'-' * 40}"))
 
                 # Run evaluation
                 eval_results = evaluate(model, test_dataloader, device, use_amp)
@@ -852,6 +872,7 @@ def train(
 
             if (time.time() - last_checkpoint_time) >= checkpoint_interval:
                 save_checkpoint(model, optimizer, scheduler, checkpoint_dir)
+                last_checkpoint_time = time.time()
 
         if total_tokens >= target_tokens:
             progress_bar.close()
