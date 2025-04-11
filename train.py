@@ -93,34 +93,44 @@ def rotate_half(x):
 
 # Multi-head Latent Attention implementation
 class MultiHeadLatentAttention(nn.Module):
-    def __init__(self, hidden_dim, num_heads, latent_dim, r_dim=None, dropout=0.1):
+    def __init__(self, hidden_dim, num_heads, latent_dim, rope_dim=None, dropout=0.1):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
         self.latent_dim = latent_dim
-        
-        # Set a safe default for rope_dim to avoid dimension issues
-        if r_dim is not None:
-            self.rope_dim = r_dim
-        else:
-            # Calculate a safe rope_dim that won't cause negative dimensions
-            # Ensure rope_dim * num_heads < hidden_dim / 2 to leave space for other dimensions
-            self.rope_dim = self.head_dim // 2
-            
-        # Query compression
-        self.q_down_proj = nn.Linear(hidden_dim, latent_dim, bias=False)
-        self.q_up_proj = nn.Linear(latent_dim, hidden_dim - self.rope_dim * num_heads, bias=False)
 
-        # Special RoPE projections
+        # Set rope_dim (dimensions for positional encoding)
+        if rope_dim is not None:
+            self.rope_dim = rope_dim
+        else:
+            # Default to 1/4 of head_dim as a reasonable value
+            self.rope_dim = self.head_dim // 4
+
+        # Content dimensions (non-RoPE parts)
+        self.content_dim = self.head_dim - self.rope_dim
+
+        # Query projections
+        # Step 1: Project into latent space
+        self.q_down_proj = nn.Linear(hidden_dim, latent_dim, bias=False)
+
+        # Step 2a: Project latent to content space (non-RoPE part)
+        self.q_up_proj = nn.Linear(latent_dim, self.content_dim * num_heads, bias=False)
+
+        # Step 2b: Project latent to RoPE space
         self.q_rope_proj = nn.Linear(latent_dim, self.rope_dim * num_heads, bias=False)
-        self.k_rope_proj = nn.Linear(hidden_dim, self.rope_dim, bias=False)
 
         # Key-Value compression to latent space
         self.kv_down_proj = nn.Linear(hidden_dim, latent_dim, bias=False)
 
-        # Latent to Key/Value expansions
-        self.k_up_proj = nn.Linear(latent_dim, hidden_dim - self.rope_dim * num_heads, bias=False)
+        # Key projections
+        # For content part (non-RoPE)
+        self.k_up_proj = nn.Linear(latent_dim, self.content_dim * num_heads, bias=False)
+
+        # For RoPE part - shared across heads to save memory
+        self.k_rope_proj = nn.Linear(hidden_dim, self.rope_dim, bias=False)
+
+        # Value projection from latent
         self.v_up_proj = nn.Linear(latent_dim, hidden_dim, bias=False)
 
         # Output projection
@@ -135,6 +145,159 @@ class MultiHeadLatentAttention(nn.Module):
         self.use_absorption = False
         self.register_buffer('q_fused_weight', None)
         self.register_buffer('q_rope_fused_weight', None)
+
+    def forward(self, x, past_key_value=None, attention_mask=None, is_causal=True, use_cache=False):
+        batch_size, seq_len, _ = x.shape
+
+        # Check if we should use optimized path
+        use_optimized = self.generation_ready and self.use_absorption and past_key_value is not None
+
+        # === QUERY PATH: Split into content and RoPE parts ===
+        if use_optimized:
+            # Fast path with fused matrices for inference
+            q_latent = F.linear(x, self.q_down_proj.weight)
+            q_c = F.linear(q_latent, self.q_up_proj.weight.t())
+            q_r = F.linear(q_latent, self.q_rope_proj.weight.t())
+        else:
+            # Standard path for training
+            q_latent = self.q_down_proj(x)
+            q_c = self.q_up_proj(q_latent)
+            q_r = self.q_rope_proj(q_latent)
+
+        # Reshape content and RoPE query parts
+        q_c = q_c.view(batch_size, seq_len, self.num_heads, self.content_dim)
+        q_r = q_r.view(batch_size, seq_len, self.num_heads, self.rope_dim)
+
+        # === POSITION EMBEDDINGS (Only for RoPE parts) ===
+        past_length = 0
+        if past_key_value is not None:
+            past_length = past_key_value[2]
+
+        # Get rotary embeddings for the current sequence
+        cos, sin = self.rotary_emb(x, seq_len=seq_len + past_length)
+
+        # Slice for current tokens only
+        q_r_pos_slice = slice(-seq_len, None) if past_length > 0 else slice(None)
+        cos_slice = cos[:, :, q_r_pos_slice]
+        sin_slice = sin[:, :, q_r_pos_slice]
+
+        # Apply RoPE only to the dedicated RoPE part
+        # Handle shape for broadcasting
+        # cos_slice and sin_slice should be [1, 1, seq_len, rope_dim]
+        # We need to reshape for broadcasting with q_r [batch, seq_len, num_heads, rope_dim]
+
+        # Add any needed dimensions to make shapes compatible
+        if cos_slice.dim() < 4:
+            cos_slice = cos_slice.unsqueeze(0).unsqueeze(0)
+        if sin_slice.dim() < 4:
+            sin_slice = sin_slice.unsqueeze(0).unsqueeze(0)
+
+        # Ensure proper dimensions for broadcasting
+        cos_slice = cos_slice.view(1, 1, cos_slice.size(-2), cos_slice.size(-1))
+        sin_slice = sin_slice.view(1, 1, sin_slice.size(-2), sin_slice.size(-1))
+
+        # Expand to match batch and heads
+        cos_slice = cos_slice.expand(batch_size, self.num_heads, -1, -1).transpose(1, 2)
+        sin_slice = sin_slice.expand(batch_size, self.num_heads, -1, -1).transpose(1, 2)
+
+        # Apply RoPE to query RoPE part
+        q_r = (q_r * cos_slice) + (rotate_half(q_r) * sin_slice)
+
+        # === KEY-VALUE PATH ===
+        # Create latent representation for KV
+        kv_latent_cur = self.kv_down_proj(x)
+
+        # For key, project both content and RoPE parts
+        k_c_cur = self.k_up_proj(kv_latent_cur)
+        k_c_cur = k_c_cur.view(batch_size, seq_len, self.num_heads, self.content_dim)
+
+        # Project the RoPE part of key directly from input
+        # This is shared across heads to save memory
+        k_r_cur = self.k_rope_proj(x)
+        k_r_cur = k_r_cur.view(batch_size, seq_len, 1, self.rope_dim)
+
+        # Apply RoPE to key RoPE part
+        k_r_cur = (k_r_cur * cos_slice[:, :, :, :self.rope_dim]) + (
+                    rotate_half(k_r_cur) * sin_slice[:, :, :, :self.rope_dim])
+
+        # === CACHE HANDLING ===
+        if past_key_value is not None:
+            kv_latent_past, k_r_past, _ = past_key_value
+            kv_latent = torch.cat([kv_latent_past, kv_latent_cur], dim=1)
+            k_r = torch.cat([k_r_past, k_r_cur], dim=1)
+            curr_seq_len = past_length + seq_len
+        else:
+            kv_latent = kv_latent_cur
+            k_r = k_r_cur
+            curr_seq_len = seq_len
+
+        # === EXPAND FROM LATENT ===
+        # Project content part of key from latent
+        k_c = self.k_up_proj(kv_latent)
+        k_c = k_c.view(batch_size, curr_seq_len, self.num_heads, self.content_dim)
+
+        # Expand RoPE key part to all heads
+        k_r = k_r.expand(batch_size, curr_seq_len, self.num_heads, self.rope_dim)
+
+        # Project value from latent
+        v = self.v_up_proj(kv_latent)
+        v = v.view(batch_size, curr_seq_len, self.num_heads, self.head_dim)
+
+        # === COMBINE CONTENT AND ROPE PARTS ===
+        # Concatenate content and RoPE parts for final query and key
+        q = torch.cat([q_c, q_r], dim=-1).transpose(1, 2)  # [B, H, S, D]
+        k = torch.cat([k_c, k_r], dim=-1).transpose(1, 2)  # [B, H, C, D]
+        v = v.transpose(1, 2)  # [B, H, C, D]
+
+        # === ATTENTION CALCULATION ===
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Apply causal mask if needed
+        if is_causal:
+            causal_mask = torch.triu(torch.ones(curr_seq_len, curr_seq_len,
+                                                dtype=torch.bool, device=x.device), diagonal=1)
+
+            if past_length > 0:
+                causal_mask = causal_mask[-seq_len:, :]
+
+            # Reshape mask for broadcasting with scores [B, H, S, C]
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            scores.masked_fill_(causal_mask, -10000.0)
+
+        # Apply attention mask with proper shape
+        if attention_mask is not None:
+            # Reshape and expand attention mask as needed
+            if attention_mask.dim() == 2:
+                # [B, S] -> [B, 1, S, 1]
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(-1)
+
+            # Expand to match scores dimensions
+            attention_mask = attention_mask.expand(-1, -1, -1, curr_seq_len)
+
+            # Expand head dimension if needed
+            if attention_mask.size(1) == 1 and scores.size(1) > 1:
+                attention_mask = attention_mask.expand(-1, self.num_heads, -1, -1)
+
+            scores = scores + attention_mask
+
+        # Apply softmax and compute weighted sum
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        context = torch.matmul(attn_weights, v)
+
+        # Reshape back
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_dim)
+
+        # Output projection
+        output = self.out_proj(context)
+
+        # Return with cache if requested
+        if use_cache:
+            return output, (kv_latent, k_r, curr_seq_len)
+        else:
+            return output
 
     def prepare_for_generation(self):
         """Optimize matrices for faster inference during generation"""
@@ -160,151 +323,6 @@ class MultiHeadLatentAttention(nn.Module):
     def set_use_absorption(self, use_absorption):
         """Toggle whether to use matrix absorption during inference"""
         self.use_absorption = use_absorption
-
-    def forward(self, x, past_key_value=None, attention_mask=None, is_causal=True, use_cache=False):
-        batch_size, seq_len, _ = x.shape
-
-        # Check if we should use optimized path
-        use_optimized = self.generation_ready and self.use_absorption and past_key_value is not None
-
-        # === QUERY PATH ===
-        if use_optimized:
-            # Fast path with fused matrices for inference
-            q_c = F.linear(x, self.q_fused_weight.t())
-            # Use the actual output size rather than calculated dimensions
-            q_c_dim = q_c.size(-1) // self.num_heads
-            q_c = q_c.view(batch_size, seq_len, self.num_heads, q_c_dim)
-
-            q_r = F.linear(x, self.q_rope_fused_weight.t())
-            q_r = q_r.view(batch_size, seq_len, self.num_heads, self.rope_dim)
-        else:
-            # Standard path for training
-            q_latent = self.q_down_proj(x)
-            q_c = self.q_up_proj(q_latent)
-            # Use the actual output size rather than calculated dimensions
-            q_c_dim = q_c.size(-1) // self.num_heads
-            q_c = q_c.view(batch_size, seq_len, self.num_heads, q_c_dim)
-
-            q_r = self.q_rope_proj(q_latent)
-            q_r = q_r.view(batch_size, seq_len, self.num_heads, self.rope_dim)
-
-        # === POSITION EMBEDDINGS ===
-        past_length = 0
-        if past_key_value is not None:
-            past_length = past_key_value[2]
-
-        # Get sequence length and ensure it matches the actual tensor dimension
-        actual_seq_len = q_r.size(1)
-        cos, sin = self.rotary_emb(q_r, actual_seq_len + past_length)
-
-        # Ensure proper slicing
-        q_r_pos_slice = slice(-actual_seq_len, None) if past_length > 0 else slice(None)
-
-        # Apply RoPE - FIX: Properly align dimensions for broadcasting
-        cos_slice = cos[:, :, q_r_pos_slice]
-        sin_slice = sin[:, :, q_r_pos_slice]
-
-        # Reshape for proper broadcasting with q_r [batch, seq_len, num_heads, rope_dim]
-        cos_slice = cos_slice.unsqueeze(0)  # [1, 1, seq_len, dim]
-        sin_slice = sin_slice.unsqueeze(0)
-        cos_slice = cos_slice.permute(0, 2, 1, 3)  # [1, seq_len, 1, dim]
-        sin_slice = sin_slice.permute(0, 2, 1, 3)
-
-        # Expand to match batch size and num_heads dimensions
-        cos_slice = cos_slice.expand(batch_size, -1, self.num_heads, -1)
-        sin_slice = sin_slice.expand(batch_size, -1, self.num_heads, -1)
-
-        # Now the shapes align for the element-wise operations
-        q_r = (q_r * cos_slice) + (rotate_half(q_r) * sin_slice)
-
-        # === KEY-VALUE PATH ===
-        kv_latent_cur = self.kv_down_proj(x)
-
-        k_r_cur = self.k_rope_proj(x)
-        k_r_cur = k_r_cur.view(batch_size, seq_len, 1, self.rope_dim)
-
-        # Apply the same reshaping for key rotary embeddings
-        k_r_cur = (k_r_cur * cos_slice.expand(-1, -1, 1, -1)) + (rotate_half(k_r_cur) * sin_slice.expand(-1, -1, 1, -1))
-
-        # === CACHE HANDLING ===
-        if past_key_value is not None:
-            kv_latent_past, k_r_past, _ = past_key_value
-            kv_latent = torch.cat([kv_latent_past, kv_latent_cur], dim=1)
-            k_r = torch.cat([k_r_past, k_r_cur], dim=1)
-            curr_seq_len = past_length + seq_len
-        else:
-            kv_latent = kv_latent_cur
-            k_r = k_r_cur
-            curr_seq_len = seq_len
-
-        # === EXPAND FROM LATENT ===
-        k_r = k_r.expand(batch_size, curr_seq_len, self.num_heads, self.rope_dim)
-
-        k_c = self.k_up_proj(kv_latent)
-        v = self.v_up_proj(kv_latent)
-
-        # Use the actual output size rather than calculated dimensions
-        k_c_dim = k_c.size(-1) // self.num_heads
-        k_c = k_c.view(batch_size, curr_seq_len, self.num_heads, k_c_dim)
-        v = v.view(batch_size, curr_seq_len, self.num_heads, self.head_dim)
-
-        # === ATTENTION CALCULATION ===
-        q = torch.cat([q_c, q_r], dim=-1).transpose(1, 2)  # [B, H, S, D]
-        k = torch.cat([k_c, k_r], dim=-1).transpose(1, 2)  # [B, H, C, D]
-        v = v.transpose(1, 2)  # [B, H, C, D]
-
-        # Compute attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        # Apply causal mask if needed
-        if is_causal:
-            causal_mask = torch.triu(torch.ones(curr_seq_len, curr_seq_len,
-                                                dtype=torch.bool, device=x.device), diagonal=1)
-
-            if past_length > 0:
-                causal_mask = causal_mask[-seq_len:, :]
-
-            # Reshape mask for broadcasting with scores [B, H, S, C]
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-            scores.masked_fill_(causal_mask, -10000.0)
-
-        # Apply attention mask with proper shape
-        if attention_mask is not None:
-            # Attention mask typically has shape [B, S] or [B, 1, S] or [B, 1, 1, S]
-            # We need to reshape it to [B, 1, S, 1] or [B, 1, S, C] to match scores [B, H, S, C]
-            if attention_mask.dim() == 2:
-                # [B, S] -> [B, 1, S, 1]
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(-1)
-            elif attention_mask.dim() == 3:
-                # [B, 1, S] -> [B, 1, S, 1]
-                attention_mask = attention_mask.unsqueeze(-1)
-
-            # Expand attention mask to match scores dimensions
-            attention_mask = attention_mask.expand(-1, -1, -1, curr_seq_len)
-
-            # If necessary, expand the head dimension
-            if attention_mask.size(1) == 1 and scores.size(1) > 1:
-                attention_mask = attention_mask.expand(-1, self.num_heads, -1, -1)
-
-            scores = scores + attention_mask
-
-        # Apply softmax and compute weighted sum
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        context = torch.matmul(attn_weights, v)
-
-        # Reshape back
-        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_dim)
-
-        # Output projection
-        output = self.out_proj(context)
-
-        # Return with cache if requested
-        if use_cache:
-            return output, (kv_latent, k_r, curr_seq_len)
-        else:
-            return output
 
 
 # Feed-forward network
