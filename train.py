@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 import os
 import time
 from tqdm import tqdm
@@ -57,7 +57,7 @@ HEAD_DIM = HIDDEN_DIM // NUM_HEADS
 FF_DIM = 4608
 MLA_LATENT_DIM = 288
 DROPOUT = 0.1
-MAX_SEQ_LENGTH = 1024
+MAX_SEQ_LENGTH = 2048
 VOCAB_SIZE = 50257  # GPT-2 tokenizer vocab size
 
 
@@ -87,37 +87,40 @@ class RotaryEmbedding(nn.Module):
 
         return self.cos_cached, self.sin_cached
 
-
-# Apply RoPE to queries and keys
-def apply_rotary_pos_emb(q, k, cos, sin):
-    # Reshape q and k for the rotation
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
 def rotate_half(x):
     x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
-
 # Multi-head Latent Attention implementation
 class MultiHeadLatentAttention(nn.Module):
-    def __init__(self, hidden_dim, num_heads, latent_dim, dropout=0.1):
+    def __init__(self, hidden_dim, num_heads, latent_dim, r_dim=None, dropout=0.1):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
         self.latent_dim = latent_dim
+        
+        # Set a safe default for rope_dim to avoid dimension issues
+        if r_dim is not None:
+            self.rope_dim = r_dim
+        else:
+            # Calculate a safe rope_dim that won't cause negative dimensions
+            # Ensure rope_dim * num_heads < hidden_dim / 2 to leave space for other dimensions
+            self.rope_dim = self.head_dim // 2
+            
+        # Query compression
+        self.q_down_proj = nn.Linear(hidden_dim, latent_dim, bias=False)
+        self.q_up_proj = nn.Linear(latent_dim, hidden_dim - self.rope_dim * num_heads, bias=False)
 
-        # Query projection (regular multi-head)
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        # Special RoPE projections
+        self.q_rope_proj = nn.Linear(latent_dim, self.rope_dim * num_heads, bias=False)
+        self.k_rope_proj = nn.Linear(hidden_dim, self.rope_dim, bias=False)
 
         # Key-Value compression to latent space
         self.kv_down_proj = nn.Linear(hidden_dim, latent_dim, bias=False)
 
         # Latent to Key/Value expansions
-        self.k_up_proj = nn.Linear(latent_dim, hidden_dim, bias=False)
+        self.k_up_proj = nn.Linear(latent_dim, hidden_dim - self.rope_dim * num_heads, bias=False)
         self.v_up_proj = nn.Linear(latent_dim, hidden_dim, bias=False)
 
         # Output projection
@@ -125,44 +128,141 @@ class MultiHeadLatentAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Rotary embeddings
-        self.rotary_emb = RotaryEmbedding(self.head_dim)
+        self.rotary_emb = RotaryEmbedding(self.rope_dim)
 
-    def forward(self, x, attention_mask=None, is_causal=True):
+        # Flag for optimized generation
+        self.generation_ready = False
+        self.use_absorption = False
+        self.register_buffer('q_fused_weight', None)
+        self.register_buffer('q_rope_fused_weight', None)
+
+    def prepare_for_generation(self):
+        """Optimize matrices for faster inference during generation"""
+        if self.generation_ready:
+            return
+
+        self.generation_ready = True
+
+        # Precompute fused matrices
+        q_fused_weight = torch.matmul(
+            self.q_up_proj.weight,
+            self.q_down_proj.weight
+        )
+        self.register_buffer('q_fused_weight', q_fused_weight)
+
+        # Fuse RoPE query projections
+        q_rope_fused_weight = torch.matmul(
+            self.q_rope_proj.weight,
+            self.q_down_proj.weight
+        )
+        self.register_buffer('q_rope_fused_weight', q_rope_fused_weight)
+
+    def set_use_absorption(self, use_absorption):
+        """Toggle whether to use matrix absorption during inference"""
+        self.use_absorption = use_absorption
+
+    def forward(self, x, past_key_value=None, attention_mask=None, is_causal=True, use_cache=False):
         batch_size, seq_len, _ = x.shape
 
-        # Project query
-        q = self.q_proj(x)
+        # Check if we should use optimized path
+        use_optimized = self.generation_ready and self.use_absorption and past_key_value is not None
 
-        # Project key-value to latent space (compression)
-        kv_latent = self.kv_down_proj(x)
+        # === QUERY PATH ===
+        if use_optimized:
+            # Fast path with fused matrices for inference
+            q_c = F.linear(x, self.q_fused_weight.t())
+            # Use the actual output size rather than calculated dimensions
+            q_c_dim = q_c.size(-1) // self.num_heads
+            q_c = q_c.view(batch_size, seq_len, self.num_heads, q_c_dim)
 
-        # Expand latent to full key and value
-        k = self.k_up_proj(kv_latent)
+            q_r = F.linear(x, self.q_rope_fused_weight.t())
+            q_r = q_r.view(batch_size, seq_len, self.num_heads, self.rope_dim)
+        else:
+            # Standard path for training
+            q_latent = self.q_down_proj(x)
+            q_c = self.q_up_proj(q_latent)
+            # Use the actual output size rather than calculated dimensions
+            q_c_dim = q_c.size(-1) // self.num_heads
+            q_c = q_c.view(batch_size, seq_len, self.num_heads, q_c_dim)
+
+            q_r = self.q_rope_proj(q_latent)
+            q_r = q_r.view(batch_size, seq_len, self.num_heads, self.rope_dim)
+
+        # === POSITION EMBEDDINGS ===
+        past_length = 0
+        if past_key_value is not None:
+            past_length = past_key_value[2]
+
+        # Get sequence length and ensure it matches the actual tensor dimension
+        actual_seq_len = q_r.size(1)
+        cos, sin = self.rotary_emb(q_r, actual_seq_len + past_length)
+        
+        # Ensure proper slicing
+        q_r_pos_slice = slice(-actual_seq_len, None) if past_length > 0 else slice(None)
+        
+        # Apply RoPE
+        cos_slice = cos[:, :, q_r_pos_slice]
+        sin_slice = sin[:, :, q_r_pos_slice]
+        
+        # Make sure dimensions match
+        if cos_slice.size(2) != q_r.size(1):
+            # Reshape if needed
+            cos_slice = cos_slice.expand(-1, -1, q_r.size(1), -1)
+            sin_slice = sin_slice.expand(-1, -1, q_r.size(1), -1)
+            
+        q_r = (q_r * cos_slice) + (rotate_half(q_r) * sin_slice)
+
+        # === KEY-VALUE PATH ===
+        kv_latent_cur = self.kv_down_proj(x)
+
+        k_r_cur = self.k_rope_proj(x)
+        k_r_cur = k_r_cur.view(batch_size, seq_len, 1, self.rope_dim)
+        
+        # Get rotary embeddings applied consistently with query rotary embeddings
+        k_r_cur = (k_r_cur * cos_slice) + (rotate_half(k_r_cur) * sin_slice)
+
+        # === CACHE HANDLING ===
+        if past_key_value is not None:
+            kv_latent_past, k_r_past, _ = past_key_value
+            kv_latent = torch.cat([kv_latent_past, kv_latent_cur], dim=1)
+            k_r = torch.cat([k_r_past, k_r_cur], dim=1)
+            curr_seq_len = past_length + seq_len
+        else:
+            kv_latent = kv_latent_cur
+            k_r = k_r_cur
+            curr_seq_len = seq_len
+
+        # === EXPAND FROM LATENT ===
+        k_r = k_r.expand(batch_size, curr_seq_len, self.num_heads, self.rope_dim)
+
+        k_c = self.k_up_proj(kv_latent)
         v = self.v_up_proj(kv_latent)
 
-        # Reshape for multi-head attention
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # Use the actual output size rather than calculated dimensions
+        k_c_dim = k_c.size(-1) // self.num_heads
+        k_c = k_c.view(batch_size, curr_seq_len, self.num_heads, k_c_dim)
+        v = v.view(batch_size, curr_seq_len, self.num_heads, self.head_dim)
 
-        # Apply rotary position embeddings
-        cos, sin = self.rotary_emb(q, seq_len)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        # === ATTENTION CALCULATION ===
+        q = torch.cat([q_c, q_r], dim=-1).transpose(1, 2)  # [B, H, S, D]
+        k = torch.cat([k_c, k_r], dim=-1).transpose(1, 2)  # [B, H, C, D]
+        v = v.transpose(1, 2)  # [B, H, C, D]
 
         # Compute attention scores
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        # Create combined mask: causal mask + padding mask
-        combined_mask = None
-        
         # Apply causal mask if needed
         if is_causal:
-            causal_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device), diagonal=1)
+            causal_mask = torch.triu(torch.ones(curr_seq_len, curr_seq_len,
+                                                dtype=torch.bool, device=x.device), diagonal=1)
+
+            if past_length > 0:
+                causal_mask = causal_mask[-seq_len:, :]
+
             scores.masked_fill_(causal_mask, -10000.0)
 
-        # Apply attention mask if provided (for padding)
+        # Apply attention mask if provided
         if attention_mask is not None:
-            # attention_mask is already in the right shape from MLATransformer
             scores = scores + attention_mask
 
         # Apply softmax and compute weighted sum
@@ -177,7 +277,11 @@ class MultiHeadLatentAttention(nn.Module):
         # Output projection
         output = self.out_proj(context)
 
-        return output
+        # Return with cache if requested
+        if use_cache:
+            return output, (kv_latent, k_r, curr_seq_len)
+        else:
+            return output
 
 
 # Feed-forward network
@@ -201,7 +305,12 @@ class FeedForward(nn.Module):
 class TransformerLayer(nn.Module):
     def __init__(self, hidden_dim, num_heads, ff_dim, latent_dim, dropout=0.1):
         super().__init__()
-        self.attention = MultiHeadLatentAttention(hidden_dim, num_heads, latent_dim, dropout)
+        self.attention = MultiHeadLatentAttention(
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            latent_dim=latent_dim,
+            dropout=dropout
+        )
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.ff = FeedForward(hidden_dim, ff_dim, dropout)
@@ -251,45 +360,139 @@ class MLATransformer(nn.Module):
         # Tie weights
         self.lm_head.weight = self.embedding.weight
 
-        # Initialize parameters
-        self.apply(self._init_weights)
+        # Flag for generation optimization
+        self.generation_ready = False
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.zeros_(module.bias)
-            torch.nn.init.ones_(module.weight)
-
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False):
         batch_size, seq_len = input_ids.shape
 
         # Embed tokens and positions
         x = self.embedding(input_ids)
 
+        # Add positional embeddings - adjust for partial positions in generation
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+        if past_key_values is not None:
+            # Adjust position IDs for generation
+            position_ids = position_ids + past_key_values[0][2]  # Add past length
+
         # Add positional embeddings
-        x = x + self.pos_embedding[:, :seq_len, :]
+        x = x + self.pos_embedding[:, position_ids, :]
 
-        # Process attention mask for transformer layers if provided
-        # Convert from [batch_size, seq_len] to [batch_size, 1, 1, seq_len] for broadcasting
-        transformer_attention_mask = None
-        if attention_mask is not None:
-            # Create a causal + padding mask
-            transformer_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            transformer_attention_mask = (1.0 - transformer_attention_mask) * -10000.0
+        # Process with attention and KV cache
+        present_key_values = [] if use_cache else None
 
-        # Apply each transformer layer with gradient checkpointing
-        for layer in self.layers:
-            x = torch.utils.checkpoint.checkpoint(layer, x, transformer_attention_mask, use_reentrant=False)
+        for i, layer in enumerate(self.layers):
+            past_key_value = past_key_values[i] if past_key_values is not None else None
+
+            if use_cache:
+                x, present_key_value = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    past_key_value=past_key_value,
+                    use_cache=True
+                )
+                present_key_values.append(present_key_value)
+            else:
+                x = layer(
+                    x,
+                    attention_mask=attention_mask
+                )
 
         x = self.norm(x)
         logits = self.lm_head(x)
 
-        return logits
+        if use_cache:
+            return logits, present_key_values
+        else:
+            return logits
+
+    def prepare_for_generation(self):
+        """Precompute optimized matrices for faster inference"""
+        if self.generation_ready:
+            return
+
+        self.generation_ready = True
+
+        # Prepare each layer for optimized generation
+        for layer in self.layers:
+            # Assuming each layer has an attention module that can be optimized
+            if hasattr(layer.attention, 'prepare_for_generation'):
+                layer.attention.prepare_for_generation()
+            if hasattr(layer.attention, 'set_use_absorption'):
+                layer.attention.set_use_absorption(True)
+
+    def generate(self, input_ids, max_length, temperature=1.0, top_k=0, top_p=0.9, device=None):
+        """Generate text using the model with KV caching for efficiency"""
+        # Prepare for optimized generation if not already done
+        if not self.generation_ready:
+            self.prepare_for_generation()
+
+        self.eval()  # Set to evaluation mode
+
+        if device is None:
+            device = input_ids.device
+
+        # Initial forward pass with the input sequence
+        batch_size, seq_len = input_ids.shape
+        attention_mask = torch.ones(batch_size, seq_len, device=device)
+
+        # Process the input sequence with caching
+        outputs = self(
+            input_ids,
+            attention_mask=attention_mask,
+            use_cache=True
+        )
+
+        logits, past_key_values = outputs
+        generated_ids = input_ids.clone()
+
+        # Generate new tokens autoregressively
+        for _ in range(max_length - seq_len):
+            # Get next token probabilities
+            next_token_logits = logits[:, -1, :] / temperature
+
+            # Apply sampling (top-k, top-p, etc.)
+            if top_k > 0:
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits[indices_to_remove] = -float('Inf')
+
+            if top_p > 0.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 0] = 0  # Keep at least one token
+
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    1, sorted_indices, sorted_indices_to_remove
+                )
+                next_token_logits[indices_to_remove] = -float('Inf')
+
+            # Sample from the filtered distribution
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            # Add to generated sequence
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+
+            # Forward pass with the last token and cached KV
+            new_attention_mask = torch.ones(batch_size, 1, device=device)
+
+            outputs = self(
+                next_token,
+                attention_mask=new_attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+
+            logits, past_key_values = outputs
+
+            # Optional: stop generation if all sequences have generated an EOS token
+            if all(generated_ids[:, -1] == self.eos_token_id):
+                break
+
+        return generated_ids
 
 
 # Training Dataset
@@ -448,7 +651,6 @@ def train(
     token_window = []
     token_times = []
     loss_window = []
-    epoch = 0
     global_steps = global_steps or len(train_dataloader)
     optimizer_steps = 0
     inference_steps = 0
@@ -458,8 +660,7 @@ def train(
     last_checkpoint_time = start_time
 
     while total_tokens < target_tokens:
-        epoch_loss = 0
-        progress_bar = tqdm(total=target_tokens, desc=f"Epoch {epoch + 1}")
+        progress_bar = tqdm(total=target_tokens, desc=f"Pretrain")
 
         eval_interval_steps = max(1, eval_interval)
 
@@ -479,7 +680,7 @@ def train(
             # Forward pass with mixed precision
             if use_amp:
                 with torch.amp.autocast('cuda'):
-                    logits = model(input_ids, attention_mask=attention_mask)
+                    logits = model(input_ids, attention_mask=attention_mask, use_cache=True)
                     loss = F.cross_entropy(
                         logits.view(-1, logits.size(-1)),
                         labels.view(-1),
@@ -490,7 +691,7 @@ def train(
                 # Backward pass with gradient scaling
                 scaler.scale(loss).backward()
             else:
-                logits = model(input_ids, attention_mask=attention_mask)
+                logits = model(input_ids, attention_mask=attention_mask, use_cache=True)
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
@@ -520,7 +721,6 @@ def train(
                 #    torch.cuda.empty_cache()
 
             # Update tracking metrics
-            epoch_loss += loss.item() * gradient_accumulation_steps
             total_tokens += input_ids.numel()
             log_loss += loss.item() * gradient_accumulation_steps
 
@@ -709,13 +909,13 @@ def evaluate(model, dataloader, device, use_amp=True):
 def main():
 
     # Hyperparameters optimized for 250M model on 2070 Super
-    batch_size = 2  # Can use batch size 2 with the smaller model
-    learning_rate = 5e-5  # Lower learning rate for stability
-    gradient_accumulation_steps = 4  # Effective batch size = 8
-    max_seq_length = 512  # Reduced for better fitting in VRAM
+    batch_size = 4  # Can use batch size 2 with the smaller model
+    learning_rate = 3e-4  # Lower learning rate for stability
+    gradient_accumulation_steps = 4  # Effective batch size = 16
+    max_seq_length = 2048  # Reduced for better fitting in VRAM
 
     # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2", model_max_length=max_seq_length)
     tokenizer.pad_token = tokenizer.eos_token
 
     dataset_title = "WikiText103"
@@ -854,26 +1054,26 @@ def main():
     print(Colors.header(f"{'='*50}"))
 
     # Initialize optimizer with weight decay and 8-bit precision
-    try:
+    #try:
         # Try to use 8-bit Adam if available (reduces optimizer memory by 75%)
-        from bitsandbytes.optim import Adam8bit
-        optimizer = Adam8bit(model.parameters(), lr=learning_rate, weight_decay=0.01)
-        print(Colors.success(f"✓ Using 8-bit Adam optimizer for memory efficiency"))
-    except ImportError:
+        #from bitsandbytes.optim import Adam8bit
+        #optimizer = Adam8bit(model.parameters(), lr=learning_rate, weight_decay=0.01)
+        #print(Colors.success(f"✓ Using 8-bit Adam optimizer for memory efficiency"))
+    #except ImportError:
         # Fall back to regular AdamW
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                "weight_decay": 0.01,
-            },
-            {
-                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-                "weight_decay": 0.0,
-            },
-        ]
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=learning_rate)
-        print(Colors.warning(f"⚠ Using regular AdamW optimizer (8-bit not available)"))
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": 0.01,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=learning_rate)
+    print(Colors.warning(f"⚠ Using regular AdamW optimizer (8-bit not available)"))
 
     # Learning rate scheduler
     target_tokens = total_params * 10
@@ -953,13 +1153,14 @@ def main():
             
     print(Colors.info(f"  • Estimated training time: {Colors.highlight(time_str)}"))
 
+    # Calculate warmup steps (e.g., 8% of total steps)
+    warmup_steps = int(0.08 * total_steps)
+
     # Create scheduler
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        max_lr=learning_rate,
-        total_steps=total_steps,
-        pct_start=0.02,
-        anneal_strategy='cos'
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
     )
 
     # Memory usage
