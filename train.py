@@ -196,20 +196,25 @@ class MultiHeadLatentAttention(nn.Module):
         # Get sequence length and ensure it matches the actual tensor dimension
         actual_seq_len = q_r.size(1)
         cos, sin = self.rotary_emb(q_r, actual_seq_len + past_length)
-        
+
         # Ensure proper slicing
         q_r_pos_slice = slice(-actual_seq_len, None) if past_length > 0 else slice(None)
-        
-        # Apply RoPE
+
+        # Apply RoPE - FIX: Properly align dimensions for broadcasting
         cos_slice = cos[:, :, q_r_pos_slice]
         sin_slice = sin[:, :, q_r_pos_slice]
-        
-        # Make sure dimensions match
-        if cos_slice.size(2) != q_r.size(1):
-            # Reshape if needed
-            cos_slice = cos_slice.expand(-1, -1, q_r.size(1), -1)
-            sin_slice = sin_slice.expand(-1, -1, q_r.size(1), -1)
-            
+
+        # Reshape for proper broadcasting with q_r [batch, seq_len, num_heads, rope_dim]
+        cos_slice = cos_slice.unsqueeze(0)  # [1, 1, seq_len, dim]
+        sin_slice = sin_slice.unsqueeze(0)
+        cos_slice = cos_slice.permute(0, 2, 1, 3)  # [1, seq_len, 1, dim]
+        sin_slice = sin_slice.permute(0, 2, 1, 3)
+
+        # Expand to match batch size and num_heads dimensions
+        cos_slice = cos_slice.expand(batch_size, -1, self.num_heads, -1)
+        sin_slice = sin_slice.expand(batch_size, -1, self.num_heads, -1)
+
+        # Now the shapes align for the element-wise operations
         q_r = (q_r * cos_slice) + (rotate_half(q_r) * sin_slice)
 
         # === KEY-VALUE PATH ===
@@ -217,9 +222,9 @@ class MultiHeadLatentAttention(nn.Module):
 
         k_r_cur = self.k_rope_proj(x)
         k_r_cur = k_r_cur.view(batch_size, seq_len, 1, self.rope_dim)
-        
-        # Get rotary embeddings applied consistently with query rotary embeddings
-        k_r_cur = (k_r_cur * cos_slice) + (rotate_half(k_r_cur) * sin_slice)
+
+        # Apply the same reshaping for key rotary embeddings
+        k_r_cur = (k_r_cur * cos_slice.expand(-1, -1, 1, -1)) + (rotate_half(k_r_cur) * sin_slice.expand(-1, -1, 1, -1))
 
         # === CACHE HANDLING ===
         if past_key_value is not None:
@@ -259,10 +264,28 @@ class MultiHeadLatentAttention(nn.Module):
             if past_length > 0:
                 causal_mask = causal_mask[-seq_len:, :]
 
+            # Reshape mask for broadcasting with scores [B, H, S, C]
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
             scores.masked_fill_(causal_mask, -10000.0)
 
-        # Apply attention mask if provided
+        # Apply attention mask with proper shape
         if attention_mask is not None:
+            # Attention mask typically has shape [B, S] or [B, 1, S] or [B, 1, 1, S]
+            # We need to reshape it to [B, 1, S, 1] or [B, 1, S, C] to match scores [B, H, S, C]
+            if attention_mask.dim() == 2:
+                # [B, S] -> [B, 1, S, 1]
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(-1)
+            elif attention_mask.dim() == 3:
+                # [B, 1, S] -> [B, 1, S, 1]
+                attention_mask = attention_mask.unsqueeze(-1)
+
+            # Expand attention mask to match scores dimensions
+            attention_mask = attention_mask.expand(-1, -1, -1, curr_seq_len)
+
+            # If necessary, expand the head dimension
+            if attention_mask.size(1) == 1 and scores.size(1) > 1:
+                attention_mask = attention_mask.expand(-1, self.num_heads, -1, -1)
+
             scores = scores + attention_mask
 
         # Apply softmax and compute weighted sum
