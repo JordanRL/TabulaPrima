@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "TabulaPrima"
+version = "0.1.0"
+description = "MLA Transformer for testing pre-training vs fine-tuning hypothesis"
+requires-python = ">=3.12"
+authors = [
+    {name = "Jordan LeDoux", email = "jordan.ledoux@gmail.com"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "numpy>=1.20.0",
+    "tqdm>=4.62.0",
+    "wandb>=0.13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "tensorboard>=2.10.0",
+    "deepspeed>=0.8.0",
+    "py-spy>=0.3.0",
+    "datasets>=3.5.0"
+]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
