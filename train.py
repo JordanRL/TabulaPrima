@@ -990,24 +990,25 @@ def train(
 
             # Calculate current perplexity (exp of loss)
             current_loss = sum(loss_window) / len(loss_window)
-            current_perplexity = math.exp(current_loss) if len(loss_window) > 1 else float('inf')
+            current_perplexity = math.exp(min(current_loss, 20)) if len(loss_window) > 1 else float('inf')
+
+            # Calculate gradient norm
+            grad_norm = 0.0
+            for param in model.parameters():
+                if param.grad is not None:
+                    grad_norm += param.grad.data.norm(2).item() ** 2
+            grad_norm = grad_norm ** 0.5
 
             # Update progress bar
             progress_bar.set_postfix({
                 "loss": f"{current_loss:.4f}",
                 "ppl": f"{current_perplexity:.2f}",
+                "grad_norm": f"{grad_norm:.4f}",
                 "tokens/s": f"{tokens_per_sec:.2f}",
-                "lr": f"{scheduler.get_last_lr()[0]:.6f}"
+                "lr": f"{scheduler.get_last_lr()[0]:.6f}",
             })
 
             if (steps_since_instrument == log_interval or optimizer_steps % eval_interval_steps == 0) and steps_since_instrument > 0 and optimizer_steps > 0:
-                # Calculate gradient norm
-                grad_norm = 0.0
-                for param in model.parameters():
-                    if param.grad is not None:
-                        grad_norm += param.grad.data.norm(2).item() ** 2
-                grad_norm = grad_norm ** 0.5
-
                 momentary_loss = log_loss / steps_since_instrument
                 momentary_perplexity = math.exp(momentary_loss)
                 training_dict = {
