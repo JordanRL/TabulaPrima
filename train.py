@@ -4,6 +4,8 @@ import sys
 import datetime
 import pickle
 import hashlib
+import traceback
+from traceback import FrameSummary
 
 import torch
 import torch.nn as nn
@@ -1154,6 +1156,37 @@ def evaluate(model, dataloader, device, use_amp=True):
 def main():
     args = parse_args()
 
+    def display_frame_info(frame_info: FrameSummary):
+        print(Colors.info(f"  File: {Colors.highlight(frame_info.filename)}"))
+        print(Colors.info(f"  Line: {Colors.highlight(frame_info.lineno)}"))
+        print(Colors.info(f"  Function: {Colors.highlight(frame_info.name)}"))
+        print(Colors.info(f"  Code: {Colors.highlight(frame_info.line.strip() if frame_info.line else 'N/A')}"))
+
+    def display_exception(exception: Exception, msg: str = "❌ Training failed with error"):
+        print(Colors.error(f"\n{msg}: {exception}"))
+        tb = exception.__traceback__
+        if tb:
+
+            stack_summary = traceback.extract_tb(tb)
+            print(f"\nFull stack depth: {len(stack_summary)}")
+
+            if len(stack_summary) > 0:
+                print(Colors.error(f"\n  ⓘ Outermost Frame (Frame 0):"))
+                frame = stack_summary[0]
+                display_frame_info(frame)
+
+            if len(stack_summary) > 1:
+                print(Colors.error(f"\n  ⓘ Caller of Error Function (Frame -2):"))
+                # -1 is where error occurred (func_z)
+                # -2 is the caller (func_y)
+                frame = stack_summary[-2]
+                display_frame_info(frame)
+
+            if len(stack_summary) > 0:
+                print(Colors.error(f"\n  ⓘ Error Location (Frame -1):"))
+                frame = stack_summary[-1]
+                display_frame_info(frame)
+
     # Handle cache directory
     if args.clear_cache and os.path.exists(args.cache_dir):
         print(Colors.warning(f"Clearing cache directory: {args.cache_dir}"))
@@ -1167,6 +1200,7 @@ def main():
 
     # Initialize variables
     trained_tokens = None
+    run_status = "setup"
 
     # Print training configuration
     print(Colors.header(f"\n{'=' * 50}"))
@@ -1180,53 +1214,57 @@ def main():
     print(Colors.info(f"  • Using Cache: {Colors.highlight('No' if args.no_cache else 'Yes')}"))
     print(Colors.info(f"  • Mixed Precision: {Colors.highlight('No' if args.no_amp else 'Yes')}"))
 
-    # Create cached datasets
-    if args.no_cache:
-        # If caching is disabled, use the original HFDataset (you would need to import this)
-        from train import HFDataset
-        train_dataset = HFDataset(
-            tokenizer=tokenizer,
-            dataset_path=args.dataset,
-            dataset_name=args.dataset_name,
-            seq_length=args.seq_length,
-            split="train"
-        )
+    try:
+        # Create cached datasets
+        if args.no_cache:
+            train_dataset = HFDataset(
+                tokenizer=tokenizer,
+                dataset_path=args.dataset,
+                dataset_name=args.dataset_name,
+                seq_length=args.seq_length,
+                split="train"
+            )
 
-        test_dataset = HFDataset(
-            tokenizer=tokenizer,
-            dataset_path=args.dataset,
-            dataset_name=args.dataset_name,
-            seq_length=args.seq_length,
-            split="test"
-        )
-    else:
-        # Use the cached dataset implementation
-        train_dataset = CachedHFDataset(
-            tokenizer=tokenizer,
-            dataset_path=args.dataset,
-            dataset_name=args.dataset_name,
-            seq_length=args.seq_length,
-            split="train",
-            cache_dir=args.cache_dir
-        )
+            test_dataset = HFDataset(
+                tokenizer=tokenizer,
+                dataset_path=args.dataset,
+                dataset_name=args.dataset_name,
+                seq_length=args.seq_length,
+                split="test"
+            )
+        else:
+            # Use the cached dataset implementation
+            train_dataset = CachedHFDataset(
+                tokenizer=tokenizer,
+                dataset_path=args.dataset,
+                dataset_name=args.dataset_name,
+                seq_length=args.seq_length,
+                split="train",
+                cache_dir=args.cache_dir
+            )
 
-        test_dataset = CachedHFDataset(
-            tokenizer=tokenizer,
-            dataset_path=args.dataset,
-            dataset_name=args.dataset_name,
-            seq_length=args.seq_length,
-            split="test",
-            cache_dir=args.cache_dir
-        )
+            test_dataset = CachedHFDataset(
+                tokenizer=tokenizer,
+                dataset_path=args.dataset,
+                dataset_name=args.dataset_name,
+                seq_length=args.seq_length,
+                split="test",
+                cache_dir=args.cache_dir
+            )
+    except Exception as e:
+        display_exception(exception=e, msg="💥 Error processing datasets")
+        run_status = "failed"
+        train_dataset = None
+        test_dataset = None
 
     # Define a collate function to handle variable length sequences
-    def collate_fn(batch):
+    def collate_fn(collate_batch):
         # Sort batch by sequence length (descending) for more efficient processing
-        batch.sort(key=lambda x: len(x["input_ids"]), reverse=True)
+        collate_batch.sort(key=lambda x: len(x["input_ids"]), reverse=True)
         
         # Get max lengths for this batch
-        max_input_len = max([len(x["input_ids"]) for x in batch])
-        max_label_len = max([len(x["labels"]) for x in batch])
+        max_input_len = max([len(x["input_ids"]) for x in collate_batch])
+        max_label_len = max([len(x["labels"]) for x in collate_batch])
         
         # Prepare padding token (usually the EOS token in GPT-2)
         pad_token_id = tokenizer.eos_token_id
@@ -1234,9 +1272,9 @@ def main():
         # Pad all sequences to max length in batch
         input_ids_padded = []
         labels_padded = []
-        attention_mask = []
+        collate_attention_mask = []
         
-        for item in batch:
+        for item in collate_batch:
             # Pad input_ids
             padding_len = max_input_len - len(item["input_ids"])
             input_ids_padded.append(
@@ -1251,7 +1289,7 @@ def main():
                 torch.ones(len(item["input_ids"]), dtype=torch.long),
                 torch.zeros(padding_len, dtype=torch.long)
             ])
-            attention_mask.append(mask)
+            collate_attention_mask.append(mask)
             
             # Pad labels with -100 (ignore in loss calculation)
             padding_len = max_label_len - len(item["labels"])
@@ -1265,268 +1303,306 @@ def main():
         # Stack into tensors
         return {
             "input_ids": torch.stack(input_ids_padded),
-            "attention_mask": torch.stack(attention_mask),
+            "attention_mask": torch.stack(collate_attention_mask),
             "labels": torch.stack(labels_padded)
         }
 
-    # Create data loaders
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,  # No multiprocessing to save memory
-        collate_fn=collate_fn
-    )
+    try:
+        if run_status == "setup":
+            # Create data loaders
+            train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=0,  # No multiprocessing to save memory
+                collate_fn=collate_fn
+            )
 
-    test_dataloader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn
-    )
-
-    # Initialize model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Print GPU info
-    print(Colors.header(f"\n{'='*50}"))
-    print(Colors.header(f" Hardware Configuration"))
-    print(Colors.header(f"{'='*50}"))
-    
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        print(Colors.success(f"✓ GPU detected: {Colors.highlight(gpu_name)}"))
-        print(Colors.info(f"  • Total VRAM: {Colors.highlight(f'{total_vram:.2f} GB')}"))
-    else:
-        print(Colors.warning("⚠ No GPU detected! Training will be very slow on CPU."))
-
-    print(Colors.header(f"\n{'='*50}"))
-    print(Colors.header(f" Model Configuration"))
-    print(Colors.header(f"{'='*50}"))
-    
-    # Create model instance
-    model = MLATransformer(
-        vocab_size=train_dataset.vocab_size,
-        hidden_dim=HIDDEN_DIM,
-        num_layers=NUM_LAYERS,
-        num_heads=NUM_HEADS,
-        ff_dim=FF_DIM,
-        latent_dim=MLA_LATENT_DIM,
-        dropout=DROPOUT,
-        max_seq_len=args.seq_length,
-    )
-    model.to(device)
-
-    # Track model parameters and memory usage
-    total_params = sum(p.numel() for p in model.parameters())
-    param_size_mb = total_params * 4 / (1024 ** 2)
-    
-    print(Colors.info(f"  • Architecture: Multi-head Latent Attention Transformer"))
-    print(Colors.info(f"  • Hidden dimension: {Colors.highlight(str(HIDDEN_DIM))}"))
-    print(Colors.info(f"  • Attention heads: {Colors.highlight(str(NUM_HEADS))}"))
-    print(Colors.info(f"  • Layers: {Colors.highlight(str(NUM_LAYERS))}"))
-    print(Colors.info(f"  • Latent dimension: {Colors.highlight(str(MLA_LATENT_DIM))}"))
-    print(Colors.info(f"  • Parameters: {Colors.highlight(f'{total_params:,}')}"))
-    print(Colors.info(f"  • Model size: {Colors.highlight(f'{param_size_mb:.2f} MB')}"))
-
-    print(Colors.header(f"\n{'='*50}"))
-    print(Colors.header(f" Training Configuration"))
-    print(Colors.header(f"{'='*50}"))
-
-    # Initialize optimizer with weight decay and 8-bit precision
-    #try:
-        # Try to use 8-bit Adam if available (reduces optimizer memory by 75%)
-        #from bitsandbytes.optim import Adam8bit
-        #optimizer = Adam8bit(model.parameters(), lr=learning_rate, weight_decay=0.01)
-        #print(Colors.success(f"✓ Using 8-bit Adam optimizer for memory efficiency"))
-    #except ImportError:
-        # Fall back to regular AdamW
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": 0.01,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-    print(Colors.warning(f"⚠ Using regular AdamW optimizer (8-bit not available)"))
-
-    # Learning rate scheduler
-    target_tokens = total_params * 10
-    total_steps = target_tokens // (train_dataset.total_tokens / (len(train_dataloader) // args.grad_acc_steps))
-    eval_interval = total_steps / 100
-    
-    # Training configuration info
-    print(Colors.info(f"  • Batch size: {Colors.highlight(str(args.batch_size))} (effective: {Colors.highlight(str(args.batch_size * args.grad_acc_steps))})"))
-    print(Colors.info(f"  • Learning rate: {Colors.highlight(str(args.learning_rate))}"))
-    print(Colors.info(f"  • Gradient accumulation steps: {Colors.highlight(str(args.grad_acc_steps))}"))
-    print(Colors.info(f"  • Estimated total optimizer steps: {Colors.highlight(f'{total_steps:,}')}"))
-    print(Colors.info(f"  • Target training tokens: {Colors.highlight(f'{target_tokens:,}')}"))
-    
-    # Measure the actual tokens per second using a warm-up phase
-    print(Colors.header(f"\n{'='*50}"))
-    print(Colors.header(f" Measuring Performance"))
-    print(Colors.header(f"{'='*50}"))
-    
-    print(Colors.info("  • Running warm-up iterations to measure tokens per second..."))
-    
-    # Do a few warm-up steps to measure performance
-    model.train()
-    
-    # Create small dataloader with a few batches for measurement
-    measure_batch_size = args.batch_size
-    measure_dataset = torch.utils.data.Subset(train_dataset, list(range(min(20, len(train_dataset)))))
-    measure_dataloader = DataLoader(
-        measure_dataset,
-        batch_size=measure_batch_size,
-        shuffle=True,
-        collate_fn=collate_fn
-    )
-    
-    # Run a few iterations and measure speed
-    start_time = time.time()
-    total_tokens_processed = 0
-    
-    with torch.no_grad():  # No need for gradients during measurement
-        for batch in measure_dataloader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            
-            # Count non-padding tokens
-            actual_tokens = attention_mask.sum().item()
-            total_tokens_processed += actual_tokens
-            
-            # Forward pass only (no backprop needed for measurement)
-            _ = model(input_ids, attention_mask=attention_mask)
-            
-            # Break after processing a few batches
-            if total_tokens_processed > 500000:  # Enough for a good measurement
-                break
-    
-    measurement_time = time.time() - start_time
-    measured_tokens_per_second = total_tokens_processed / measurement_time
-    
-    # Apply a conservative factor to account for backpropagation and later epoch slowdown
-    estimated_tokens_per_second = measured_tokens_per_second * 0.55  # 55% of measured forward-only speed
-    
-    print(Colors.success(f"  • Measured forward pass speed: {Colors.highlight(f'{measured_tokens_per_second:.1f}')} tokens/sec"))
-    print(Colors.success(f"  • Estimated training speed: {Colors.highlight(f'{estimated_tokens_per_second:.1f}')} tokens/sec"))
-    
-    # Calculate training time estimate
-    estimated_hours = (target_tokens / estimated_tokens_per_second) / 3600
-    
-    # Format time estimate nicely
-    if estimated_hours < 1:
-        time_str = f"{estimated_hours * 60:.1f} minutes"
-    else:
-        days = int(estimated_hours // 24)
-        hours = int(estimated_hours % 24)
-        minutes = int((estimated_hours * 60) % 60)
-        if days > 0:
-            time_str = f"{days}d {hours}h {minutes}m"
+            test_dataloader = DataLoader(
+                test_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=collate_fn
+            )
         else:
-            time_str = f"{hours}h {minutes}m"
-            
-    print(Colors.info(f"  • Estimated training time: {Colors.highlight(time_str)}"))
+            print(Colors.warning(f"\n  🚫 Data loaders skipped due to previous error"))
+            train_dataloader = None
+            test_dataloader = None
+    except Exception as e:
+        display_exception(exception=e, msg="💥 Error creating data loaders")
+        run_status = "failed"
+        train_dataloader = None
+        test_dataloader = None
 
-    # Calculate warmup steps (e.g., 8% of total steps)
-    warmup_steps = int(0.08 * total_steps)
+    try:
+        if run_status == "setup":
+            # Initialize model
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Create scheduler
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps
-    )
+            # Print GPU info
+            print(Colors.header(f"\n{'='*50}"))
+            print(Colors.header(f" Hardware Configuration"))
+            print(Colors.header(f"{'='*50}"))
 
-    # Memory usage
-    print(Colors.header(f"\n{'='*50}"))
-    print(Colors.header(f" Memory Usage"))
-    print(Colors.header(f"{'='*50}"))
-    
-    allocated_gb = torch.cuda.memory_allocated(device) / (1024 ** 3) 
-    reserved_gb = torch.cuda.memory_reserved(device) / (1024 ** 3)
-    print(Colors.info(f"  • GPU memory allocated: {Colors.highlight(f'{allocated_gb:.2f} GB')}"))
-    print(Colors.info(f"  • GPU memory reserved: {Colors.highlight(f'{reserved_gb:.2f} GB')}"))
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                print(Colors.success(f"✓ GPU detected: {Colors.highlight(gpu_name)}"))
+                print(Colors.info(f"  • Total VRAM: {Colors.highlight(f'{total_vram:.2f} GB')}"))
+            else:
+                print(Colors.warning("⚠ No GPU detected! Training will be very slow on CPU."))
 
-    # Check gradient enabled for params
-    check_grad_enabled(model)
+            print(Colors.header(f"\n{'='*50}"))
+            print(Colors.header(f" Model Configuration"))
+            print(Colors.header(f"{'='*50}"))
 
-    # Initialize wandb (optional)
-    wandb.init(
-        project="TabulaPrima",
-        entity="jordan-ledoux-none",
-        job_type="training",
-        tags=["experiment","generic-dataset","pretraining"],
-        config={
-            "parameters": total_params,
-            "batch_size": args.batch_size,
-            "learning_rate": args.learning_rate,
-            "gradient_accumulation_steps": args.grad_acc_steps,
-            "optimizer": "Adam8Bit" if "8bit" in optimizer.__class__.__name__ else "AdamW",
-        },
-        name=args.dataset+"_"+datetime.datetime.now().strftime("%Y%m%d_%H%M"),
-    )
-    """
-    wandb.watch(
-        model,
-        log="all",
-        log_freq=100
-    )
-    """
+            # Create model instance
+            model = MLATransformer(
+                vocab_size=train_dataset.vocab_size,
+                hidden_dim=HIDDEN_DIM,
+                num_layers=NUM_LAYERS,
+                num_heads=NUM_HEADS,
+                ff_dim=FF_DIM,
+                latent_dim=MLA_LATENT_DIM,
+                dropout=DROPOUT,
+                max_seq_len=args.seq_length,
+            )
+            model.to(device)
+        else:
+            print(Colors.warning(f"\n  🚫 Model configuration skipped due to previous error"))
+            model = None
+            device = None
+    except Exception as e:
+        display_exception(exception=e, msg="❌ Unable to load model")
+        run_status = "failed"
+        model = None
+        device = None
+
+    try:
+        if run_status == "setup":
+            # Track model parameters and memory usage
+            total_params = sum(p.numel() for p in model.parameters())
+            param_size_mb = total_params * 4 / (1024 ** 2)
+
+            print(Colors.info(f"  • Architecture: Multi-head Latent Attention Transformer"))
+            print(Colors.info(f"  • Hidden dimension: {Colors.highlight(str(HIDDEN_DIM))}"))
+            print(Colors.info(f"  • Attention heads: {Colors.highlight(str(NUM_HEADS))}"))
+            print(Colors.info(f"  • Layers: {Colors.highlight(str(NUM_LAYERS))}"))
+            print(Colors.info(f"  • Latent dimension: {Colors.highlight(str(MLA_LATENT_DIM))}"))
+            print(Colors.info(f"  • Parameters: {Colors.highlight(f'{total_params:,}')}"))
+            print(Colors.info(f"  • Model size: {Colors.highlight(f'{param_size_mb:.2f} MB')}"))
+
+            print(Colors.header(f"\n{'='*50}"))
+            print(Colors.header(f" Training Configuration"))
+            print(Colors.header(f"{'='*50}"))
+
+            # Initialize optimizer with weight decay and 8-bit precision
+            #try:
+                # Try to use 8-bit Adam if available (reduces optimizer memory by 75%)
+                #from bitsandbytes.optim import Adam8bit
+                #optimizer = Adam8bit(model.parameters(), lr=learning_rate, weight_decay=0.01)
+                #print(Colors.success(f"✓ Using 8-bit Adam optimizer for memory efficiency"))
+            #except ImportError:
+                # Fall back to regular AdamW
+            no_decay = ["bias", "LayerNorm.weight"]
+            optimizer_grouped_parameters = [
+                {
+                    "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                    "weight_decay": 0.01,
+                },
+                {
+                    "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                    "weight_decay": 0.0,
+                },
+            ]
+            optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+            print(Colors.warning(f"⚠ Using regular AdamW optimizer (8-bit not available)"))
+        else:
+            print(Colors.warning(f"\n  🚫 Optimizer configuration skipped due to previous error"))
+            optimizer = None
+            total_params = 0
+    except Exception as e:
+        display_exception(exception=e, msg="❌ Unable to create optimizer")
+        run_status = "failed"
+        optimizer = None
+        total_params = 0
+
+    if run_status == "setup":
+        # Learning rate scheduler
+        target_tokens = total_params * 10
+        total_steps = target_tokens // (train_dataset.total_tokens / (len(train_dataloader) // args.grad_acc_steps))
+        eval_interval = total_steps / 100
+
+        # Training configuration info
+        print(Colors.info(f"  • Batch size: {Colors.highlight(str(args.batch_size))} (effective: {Colors.highlight(str(args.batch_size * args.grad_acc_steps))})"))
+        print(Colors.info(f"  • Learning rate: {Colors.highlight(str(args.learning_rate))}"))
+        print(Colors.info(f"  • Gradient accumulation steps: {Colors.highlight(str(args.grad_acc_steps))}"))
+        print(Colors.info(f"  • Estimated total optimizer steps: {Colors.highlight(f'{total_steps:,}')}"))
+        print(Colors.info(f"  • Target training tokens: {Colors.highlight(f'{target_tokens:,}')}"))
+
+        # Measure the actual tokens per second using a warm-up phase
+        print(Colors.header(f"\n{'='*50}"))
+        print(Colors.header(f" Measuring Performance"))
+        print(Colors.header(f"{'='*50}"))
+
+        print(Colors.info("  • Running warm-up iterations to measure tokens per second..."))
+    else:
+        target_tokens = 0
+        total_steps = 0
+        eval_interval = None
+
+    try:
+        if run_status == "setup":
+            # Do a few warm-up steps to measure performance
+            model.train()
+
+            # Create small dataloader with a few batches for measurement
+            measure_batch_size = args.batch_size
+            measure_dataset = torch.utils.data.Subset(train_dataset, list(range(min(20, len(train_dataset)))))
+            measure_dataloader = DataLoader(
+                measure_dataset,
+                batch_size=measure_batch_size,
+                shuffle=True,
+                collate_fn=collate_fn
+            )
+
+            # Run a few iterations and measure speed
+            start_time = time.time()
+            total_tokens_processed = 0
+
+            with torch.no_grad():  # No need for gradients during measurement
+                for batch in measure_dataloader:
+                    input_ids = batch['input_ids'].to(device)
+                    attention_mask = batch['attention_mask'].to(device)
+
+                    # Count non-padding tokens
+                    actual_tokens = attention_mask.sum().item()
+                    total_tokens_processed += actual_tokens
+
+                    # Forward pass only (no backprop needed for measurement)
+                    _ = model(input_ids, attention_mask=attention_mask)
+
+                    # Break after processing a few batches
+                    if total_tokens_processed > 500000:  # Enough for a good measurement
+                        break
+
+            measurement_time = time.time() - start_time
+            measured_tokens_per_second = total_tokens_processed / measurement_time
+
+            # Apply a conservative factor to account for backpropagation and later epoch slowdown
+            estimated_tokens_per_second = measured_tokens_per_second * 0.55  # 55% of measured forward-only speed
+
+            print(Colors.success(f"  • Measured forward pass speed: {Colors.highlight(f'{measured_tokens_per_second:.1f}')} tokens/sec"))
+            print(Colors.success(f"  • Estimated training speed: {Colors.highlight(f'{estimated_tokens_per_second:.1f}')} tokens/sec"))
+
+            # Calculate training time estimate
+            estimated_hours = (target_tokens / estimated_tokens_per_second) / 3600
+
+            # Format time estimate nicely
+            if estimated_hours < 1:
+                time_str = f"{estimated_hours * 60:.1f} minutes"
+            else:
+                days = int(estimated_hours // 24)
+                hours = int(estimated_hours % 24)
+                minutes = int((estimated_hours * 60) % 60)
+                if days > 0:
+                    time_str = f"{days}d {hours}h {minutes}m"
+                else:
+                    time_str = f"{hours}h {minutes}m"
+
+            print(Colors.info(f"  • Estimated training time: {Colors.highlight(time_str)}"))
+        else:
+            print(Colors.warning(f"\n  🚫 Training time estimation skipper due to previous error"))
+    except Exception as e:
+        display_exception(exception=e, msg="❌ Unable to estimate training time")
+        run_status = "failed"
+
+    try:
+        if run_status == "setup":
+            # Calculate warmup steps (e.g., 8% of total steps)
+            warmup_steps = int(0.08 * total_steps)
+
+            # Create scheduler
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps
+            )
+
+            # Memory usage
+            print(Colors.header(f"\n{'='*50}"))
+            print(Colors.header(f" Memory Usage"))
+            print(Colors.header(f"{'='*50}"))
+
+            # Check gradient enabled for params
+            check_grad_enabled(model)
+
+            # Initialize wandb (optional)
+            wandb.init(
+                project="TabulaPrima",
+                entity="jordan-ledoux-none",
+                job_type="training",
+                tags=["experiment","generic-dataset","pretraining"],
+                config={
+                    "parameters": total_params,
+                    "batch_size": args.batch_size,
+                    "learning_rate": args.learning_rate,
+                    "gradient_accumulation_steps": args.grad_acc_steps,
+                    "optimizer": "Adam8Bit" if "8bit" in optimizer.__class__.__name__ else "AdamW",
+                },
+                name=args.dataset+"_"+datetime.datetime.now().strftime("%Y%m%d_%H%M"),
+            )
+            """
+            wandb.watch(
+                model,
+                log="all",
+                log_freq=100
+            )
+            """
+        else:
+            print(Colors.warning(f"\n  🚫 Scheduler configuration skipped due to previous error"))
+            scheduler = None
+    except Exception as e:
+        display_exception(exception=e, msg="❌ Unable to create scheduler")
+        run_status = "failed"
+        scheduler = None
+
     train_start_time = time.time()
 
     # Start training
     try:
-        trained_tokens = train(
-            model=model,
-            train_dataloader=train_dataloader,
-            test_dataloader=test_dataloader,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device=device,
-            total_parameters=total_params,
-            gradient_accumulation_steps=args.grad_acc_steps,
-            checkpoint_dir="checkpoints",
-            eval_interval=eval_interval,
-            global_steps=total_steps,
-        )
+        if run_status == "setup":
+            run_status = "training"
+            trained_tokens = train(
+                model=model,
+                train_dataloader=train_dataloader,
+                test_dataloader=test_dataloader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                device=device,
+                total_parameters=total_params,
+                gradient_accumulation_steps=args.grad_acc_steps,
+                checkpoint_dir="checkpoints",
+                eval_interval=eval_interval,
+                global_steps=total_steps,
+            )
+            run_status = "success"
+        else:
+            print(Colors.warning(f"\n  🚫 Training skipped due to previous error"))
     except KeyboardInterrupt:
         print(Colors.warning("\n⚠ Training interrupted by user"))
         wandb.alert(title="Training interrupted", text="Training interrupted by user")
-        wandb.run.status = "stopped"
+        wandb.run.status = run_status = "stopped"
     except Exception as e:
-        print(Colors.error(f"\n❌ Training failed with error: {e}"))
+        display_exception(exception=e, msg="❌ Training failed with error")
         wandb.alert(title="Training failed", text=f"An error occurred during training: {e}")
-        wandb.run.status = "failed"
+        wandb.run.status = run_status = "failed"
     finally:
         # Calculate training statistics
         train_end_time = time.time()
         total_training_time = train_end_time - train_start_time
         total_training_hours = total_training_time / 3600
-        
-        # Get actual checkpoint information if we finished at least one epoch
-        best_result = {}
-        try:
-            best_model_path = os.path.join("checkpoints", "best_model.pt")
-            if os.path.exists(best_model_path):
-                checkpoint = torch.load(best_model_path, map_location="cpu")
-                best_result = {
-                    "best_epoch": checkpoint.get("epoch", 0),
-                    "best_train_loss": checkpoint.get("train_loss", float('inf')),
-                    "best_train_perplexity": checkpoint.get("train_perplexity", float('inf')),
-                    "best_test_loss": checkpoint.get("test_loss", float('inf')),
-                    "best_test_perplexity": checkpoint.get("test_perplexity", float('inf')),
-                    "best_test_accuracy": checkpoint.get("test_accuracy", 0),
-                }
-        except Exception as e:
-            print(Colors.warning(f"Could not load best model info: {e}"))
             
         # Calculate hardware metrics
         if torch.cuda.is_available():
@@ -1571,9 +1647,6 @@ def main():
             "run/gpu_utilization_pct": gpu_utilization,
             "run/memory_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0,
             "run/memory_reserved_gb": torch.cuda.memory_reserved(device) / (1024 ** 3) if torch.cuda.is_available() else 0,
-            
-            # Best model performance
-            **{f"run/{k}": v for k, v in best_result.items()},
         })
         
         # Create a final summary table
@@ -1584,9 +1657,6 @@ def main():
                 ["Average Tokens/Second", f"{avg_tokens_per_second:.2f}"],
                 ["Total Tokens Processed", f"{total_tokens:,}"],
                 ["Model Parameters", f"{sum(p.numel() for p in model.parameters()):,}"],
-                ["Highest Test Accuracy", f"{best_result.get('best_test_accuracy', 0):.2%}"],
-                ["Lowest Test Perplexity", f"{best_result.get('best_test_perplexity', float('inf')):.2f}"],
-                ["Best Epoch", f"{best_result.get('best_epoch', 0)}"],
                 ["GPU Utilization", f"{gpu_utilization:.1f}%"],
             ]
             wandb.log({"run/summary_table": wandb.Table(columns=columns, data=data)})
@@ -1598,17 +1668,17 @@ def main():
     print(Colors.header(f"{'='*50}"))
 
     # Save final model
-    final_model_path = os.path.join("models", f"tabula_prima_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.pt")
-    torch.save(model, final_model_path)
-    print(Colors.success(f"✓ Saved final model to: {final_model_path}"))
+    if run_status != "failed":
+        final_model_path = os.path.join("models", f"tabula_prima_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.pt")
+        torch.save(model, final_model_path)
+        print(Colors.success(f"✓ Saved final model to: {final_model_path}"))
 
-    # Final memory usage
-    allocated_gb = torch.cuda.memory_allocated(device) / (1024 ** 3) 
-    reserved_gb = torch.cuda.memory_reserved(device) / (1024 ** 3)
-    print(Colors.info(f"  • Final GPU memory allocated: {Colors.highlight(f'{allocated_gb:.2f} GB')}"))
-    print(Colors.info(f"  • Final GPU memory reserved: {Colors.highlight(f'{reserved_gb:.2f} GB')}"))
-    
-    print(Colors.success(f"\n✨ Training process completed successfully! ✨"))
+    if run_status == "failed":
+        print(Colors.error(f"\n❌ Training process experienced an error ❌"))
+    elif run_status == "stopped":
+        print(Colors.warning(f"\n🚫 Training process was stopped manually 🚫"))
+    else:
+        print(Colors.success(f"\n✨ Training process completed successfully ✨"))
 
 
 # TensorBoard callback for monitoring (alternative to Wandb)
