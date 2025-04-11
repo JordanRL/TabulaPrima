@@ -3,3 +3,4 @@ checkpoints
 models
 TabulaPrima.egg-info
 wandb
+dataset_cache
