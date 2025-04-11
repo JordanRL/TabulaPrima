@@ -1,6 +1,9 @@
+import argparse
 import math
 import sys
 import datetime
+import pickle
+import hashlib
 
 import torch
 import torch.nn as nn
@@ -59,7 +62,34 @@ MLA_LATENT_DIM = 288
 DROPOUT = 0.1
 MAX_SEQ_LENGTH = 2048
 VOCAB_SIZE = 50257  # GPT-2 tokenizer vocab size
+BATCH_SIZE = 4
+GRAD_STEPS = 4
+LEARNING_RATE = 3e-4
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train an MLA Transformer with cached datasets")
+
+    # Dataset arguments
+    parser.add_argument("--dataset", type=str, default="wikitext", help="Dataset path (e.g., wikitext)")
+    parser.add_argument("--dataset-name", type=str, default="wikitext-103-raw-v1", help="Dataset name")
+    parser.add_argument("--run-name", type=str, default="WikiText103", help="The base name of the run in W&B")
+    parser.add_argument("--cache-dir", type=str, default="dataset_cache", help="Directory to store cached datasets")
+    parser.add_argument("--no-cache", action="store_true", help="Disable dataset caching")
+    parser.add_argument("--clear-cache", action="store_true", help="Clear existing cache before training")
+
+    # Model arguments
+    parser.add_argument("--seq-length", type=int, default=MAX_SEQ_LENGTH, help="Maximum sequence length")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size per GPU")
+    parser.add_argument("--grad-acc-steps", type=int, default=GRAD_STEPS, help="Gradient accumulation steps")
+    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="Learning rate")
+
+    # Training arguments
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--model-dir", type=str, default="models", help="Directory to save final model")
+    parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision training")
+
+    return parser.parse_args()
 
 # Memory-efficient Rotary Position Embedding (RoPE)
 class RotaryEmbedding(nn.Module):
@@ -678,6 +708,159 @@ class HFDataset(Dataset):
         }
 
 
+class CachedHFDataset(Dataset):
+    def __init__(self, tokenizer, dataset_path, dataset_name=None, seq_length=2048, split="train",
+                 cache_dir="dataset_cache"):
+        """
+        Initialize the dataset from Hugging Face with caching for tokenized examples.
+
+        Args:
+            tokenizer: Tokenizer to use for encoding text
+            dataset_path: Dataset path (e.g., "wikitext")
+            dataset_name: Dataset name (e.g., "wikitext-2-raw-v1")
+            seq_length: Maximum sequence length
+            split: Either "train" or "test"
+            cache_dir: Directory to store cached tokenized datasets
+        """
+        self.tokenizer = tokenizer
+        self.seq_length = seq_length
+        self.split = split
+        self.cache_dir = cache_dir
+
+        # Create a unique cache key based on tokenizer, dataset, and sequence length
+        # This ensures we regenerate cache if any of these change
+        tokenizer_name = tokenizer.__class__.__name__
+        self.vocab_size = len(tokenizer)
+        cache_key = f"{tokenizer_name}_{self.vocab_size}_{dataset_path}_{dataset_name or ''}_{split}_{seq_length}"
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
+        self.cache_file = os.path.join(cache_dir, f"{cache_hash}.pkl")
+
+        print(f"\n{'=' * 50}")
+        print(f" Dataset: {dataset_path}/{dataset_name or ''} ({split})")
+        print(f"{'=' * 50}")
+
+        # Try to load from cache first
+        self.examples = self._load_from_cache()
+
+        # If not in cache, process the dataset and save to cache
+        if self.examples is None:
+            from datasets import load_dataset
+
+            print(f"Cache miss. Loading and tokenizing dataset...")
+            self.raw_dataset = load_dataset(dataset_path, dataset_name, trust_remote_code=True)
+            self.examples = []
+            self.total_tokens = 0
+
+            # Process each text item to create examples
+            skipped_short = 0
+            text_items = 0
+
+            # Progress bar for dataset processing
+            texts = self.raw_dataset[split]["text"]
+            for text in tqdm(texts, desc=f"Processing {split} texts", unit="text"):
+                if not text.strip():
+                    continue
+
+                text_items += 1
+                # Tokenize the current text item
+                encodings = tokenizer(text, return_tensors="pt", truncation=False)
+                input_ids = encodings.input_ids[0]
+                self.total_tokens += len(input_ids)
+
+                # Skip if this text is too short
+                if len(input_ids) < 4:  # Need at least a few tokens
+                    skipped_short += 1
+                    continue
+
+                # Split into examples with stride
+                for i in range(0, max(1, len(input_ids) - seq_length), seq_length // 2):
+                    end_idx = min(i + seq_length, len(input_ids))
+                    if end_idx - i < seq_length // 4:  # Skip if too short
+                        continue
+
+                    # Get the example with consistent length whenever possible
+                    if end_idx - i == seq_length:
+                        # Full-length example, just clone it
+                        self.examples.append(input_ids[i:end_idx].clone())
+                    else:
+                        # This example is at the end of the text and shorter than seq_length
+                        example = input_ids[i:end_idx].clone()
+                        # Ensure all examples have at least 4 tokens for training
+                        if len(example) >= 4:
+                            self.examples.append(example)
+
+            # Ensure we have at least one example
+            if len(self.examples) == 0:
+                print(f"Warning: No examples found in {split} set, creating a dummy example")
+                self.examples.append(torch.tensor([tokenizer.bos_token_id, tokenizer.eos_token_id]))
+
+            # Save processed examples to cache
+            self._save_to_cache()
+
+        # Print summary information
+        print(f"\n✓ Loaded {split} dataset:")
+        print(f"  • Dataset: {dataset_path}/{dataset_name or ''}")
+        print(f"  • Split: {split}")
+        print(f"  • Examples: {len(self.examples):,}")
+        if hasattr(self, 'total_tokens'):
+            print(f"  • Total tokens: {self.total_tokens:,}")
+            print(f"  • Avg tokens per example: {self.total_tokens / max(1, len(self.examples)):.1f}")
+        print(f"  • Sequence length: {seq_length}")
+        if self._was_cached():
+            print(f"  • Loaded from cache: Yes ✓")
+        else:
+            print(f"  • Saved to cache: Yes ✓")
+
+    def _load_from_cache(self):
+        """Try to load the dataset from cache file"""
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir, exist_ok=True)
+            return None
+
+        if os.path.exists(self.cache_file):
+            try:
+                print(f"Loading cached dataset from {self.cache_file}...")
+                with open(self.cache_file, 'rb') as f:
+                    cache_data = pickle.load(f)
+                    self.total_tokens = cache_data['total_tokens']
+                    return cache_data['examples']
+            except Exception as e:
+                print(f"Error loading cache: {e}")
+                return None
+        return None
+
+    def _save_to_cache(self):
+        """Save the processed dataset to cache file"""
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir, exist_ok=True)
+
+        print(f"Saving dataset to cache at {self.cache_file}...")
+        with open(self.cache_file, 'wb') as f:
+            cache_data = {
+                'examples': self.examples,
+                'total_tokens': self.total_tokens
+            }
+            pickle.dump(cache_data, f)
+
+    def _was_cached(self):
+        """Check if dataset was loaded from cache"""
+        return os.path.exists(self.cache_file)
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        input_ids = self.examples[idx]
+
+        # Create inputs and labels for causal language modeling
+        # Input: all tokens except the last one
+        # Labels: all tokens except the first one
+        return {
+            "input_ids": input_ids[:-1],
+            "labels": input_ids[1:]
+        }
+
+
 # Memory-efficient training function with additional optimizations for 2070 Super
 def train(
         model,
@@ -969,36 +1152,72 @@ def evaluate(model, dataloader, device, use_amp=True):
 
 # Main training script with improvements for 2070 Super
 def main():
+    args = parse_args()
 
-    # Hyperparameters optimized for 250M model on 2070 Super
-    batch_size = 4  # Can use batch size 2 with the smaller model
-    learning_rate = 3e-4  # Lower learning rate for stability
-    gradient_accumulation_steps = 4  # Effective batch size = 16
-    max_seq_length = 2048  # Reduced for better fitting in VRAM
+    # Handle cache directory
+    if args.clear_cache and os.path.exists(args.cache_dir):
+        print(Colors.warning(f"Clearing cache directory: {args.cache_dir}"))
+        for file in os.listdir(args.cache_dir):
+            if file.endswith(".pkl"):
+                os.remove(os.path.join(args.cache_dir, file))
 
     # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("gpt2", model_max_length=max_seq_length)
+    tokenizer = AutoTokenizer.from_pretrained("gpt2", model_max_length=args.seq_length)
     tokenizer.pad_token = tokenizer.eos_token
 
-    dataset_title = "WikiText103"
+    # Initialize variables
     trained_tokens = None
 
-    # Create dataset and dataloader
-    train_dataset = HFDataset(
-        tokenizer=tokenizer,
-        dataset_path="wikitext",
-        dataset_name="wikitext-103-raw-v1",
-        seq_length=max_seq_length,
-        split="train"
-    )
+    # Print training configuration
+    print(Colors.header(f"\n{'=' * 50}"))
+    print(Colors.header(f" Training Configuration"))
+    print(Colors.header(f"{'=' * 50}"))
+    print(Colors.info(f"  • Dataset: {Colors.highlight(f'{args.dataset}/{args.dataset_name}')}"))
+    print(Colors.info(f"  • Sequence Length: {Colors.highlight(str(args.seq_length))}"))
+    print(Colors.info(f"  • Batch Size: {Colors.highlight(str(args.batch_size))} " +
+                      f"(effective: {Colors.highlight(str(args.batch_size * args.grad_acc_steps))})"))
+    print(Colors.info(f"  • Learning Rate: {Colors.highlight(str(args.learning_rate))}"))
+    print(Colors.info(f"  • Using Cache: {Colors.highlight('No' if args.no_cache else 'Yes')}"))
+    print(Colors.info(f"  • Mixed Precision: {Colors.highlight('No' if args.no_amp else 'Yes')}"))
 
-    test_dataset = HFDataset(
-        tokenizer=tokenizer,
-        dataset_path="wikitext",
-        dataset_name="wikitext-103-raw-v1",
-        seq_length=max_seq_length,
-        split="test"
-    )
+    # Create cached datasets
+    if args.no_cache:
+        # If caching is disabled, use the original HFDataset (you would need to import this)
+        from train import HFDataset
+        train_dataset = HFDataset(
+            tokenizer=tokenizer,
+            dataset_path=args.dataset,
+            dataset_name=args.dataset_name,
+            seq_length=args.seq_length,
+            split="train"
+        )
+
+        test_dataset = HFDataset(
+            tokenizer=tokenizer,
+            dataset_path=args.dataset,
+            dataset_name=args.dataset_name,
+            seq_length=args.seq_length,
+            split="test"
+        )
+    else:
+        # Use the cached dataset implementation
+        train_dataset = CachedHFDataset(
+            tokenizer=tokenizer,
+            dataset_path=args.dataset,
+            dataset_name=args.dataset_name,
+            seq_length=args.seq_length,
+            split="train",
+            cache_dir=args.cache_dir
+        )
+
+        test_dataset = CachedHFDataset(
+            tokenizer=tokenizer,
+            dataset_path=args.dataset,
+            dataset_name=args.dataset_name,
+            seq_length=args.seq_length,
+            split="test",
+            cache_dir=args.cache_dir
+        )
 
     # Define a collate function to handle variable length sequences
     def collate_fn(batch):
@@ -1050,9 +1269,10 @@ def main():
             "labels": torch.stack(labels_padded)
         }
 
+    # Create data loaders
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         shuffle=True,
         num_workers=0,  # No multiprocessing to save memory
         collate_fn=collate_fn
@@ -1060,7 +1280,7 @@ def main():
 
     test_dataloader = DataLoader(
         test_dataset,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         shuffle=False,
         num_workers=0,
         collate_fn=collate_fn
@@ -1088,14 +1308,14 @@ def main():
     
     # Create model instance
     model = MLATransformer(
-        vocab_size=VOCAB_SIZE,
+        vocab_size=train_dataset.vocab_size,
         hidden_dim=HIDDEN_DIM,
         num_layers=NUM_LAYERS,
         num_heads=NUM_HEADS,
         ff_dim=FF_DIM,
         latent_dim=MLA_LATENT_DIM,
         dropout=DROPOUT,
-        max_seq_len=max_seq_length
+        max_seq_len=args.seq_length,
     )
     model.to(device)
 
@@ -1134,18 +1354,18 @@ def main():
             "weight_decay": 0.0,
         },
     ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=learning_rate)
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
     print(Colors.warning(f"⚠ Using regular AdamW optimizer (8-bit not available)"))
 
     # Learning rate scheduler
     target_tokens = total_params * 10
-    total_steps = target_tokens // (train_dataset.total_tokens / (len(train_dataloader) // gradient_accumulation_steps))
+    total_steps = target_tokens // (train_dataset.total_tokens / (len(train_dataloader) // args.grad_acc_steps))
     eval_interval = total_steps / 100
     
     # Training configuration info
-    print(Colors.info(f"  • Batch size: {Colors.highlight(str(batch_size))} (effective: {Colors.highlight(str(batch_size * gradient_accumulation_steps))})"))
-    print(Colors.info(f"  • Learning rate: {Colors.highlight(str(learning_rate))}"))
-    print(Colors.info(f"  • Gradient accumulation steps: {Colors.highlight(str(gradient_accumulation_steps))}"))
+    print(Colors.info(f"  • Batch size: {Colors.highlight(str(args.batch_size))} (effective: {Colors.highlight(str(args.batch_size * args.grad_acc_steps))})"))
+    print(Colors.info(f"  • Learning rate: {Colors.highlight(str(args.learning_rate))}"))
+    print(Colors.info(f"  • Gradient accumulation steps: {Colors.highlight(str(args.grad_acc_steps))}"))
     print(Colors.info(f"  • Estimated total optimizer steps: {Colors.highlight(f'{total_steps:,}')}"))
     print(Colors.info(f"  • Target training tokens: {Colors.highlight(f'{target_tokens:,}')}"))
     
@@ -1160,7 +1380,7 @@ def main():
     model.train()
     
     # Create small dataloader with a few batches for measurement
-    measure_batch_size = batch_size 
+    measure_batch_size = args.batch_size
     measure_dataset = torch.utils.data.Subset(train_dataset, list(range(min(20, len(train_dataset)))))
     measure_dataloader = DataLoader(
         measure_dataset,
@@ -1246,12 +1466,12 @@ def main():
         tags=["experiment","generic-dataset","pretraining"],
         config={
             "parameters": total_params,
-            "batch_size": batch_size,
-            "learning_rate": learning_rate,
-            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "gradient_accumulation_steps": args.grad_acc_steps,
             "optimizer": "Adam8Bit" if "8bit" in optimizer.__class__.__name__ else "AdamW",
         },
-        name=dataset_title+"_"+datetime.datetime.now().strftime("%Y%m%d_%H%M"),
+        name=args.dataset+"_"+datetime.datetime.now().strftime("%Y%m%d_%H%M"),
     )
     """
     wandb.watch(
@@ -1272,7 +1492,7 @@ def main():
             scheduler=scheduler,
             device=device,
             total_parameters=total_params,
-            gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_accumulation_steps=args.grad_acc_steps,
             checkpoint_dir="checkpoints",
             eval_interval=eval_interval,
             global_steps=total_steps,
