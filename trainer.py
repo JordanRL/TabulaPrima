@@ -390,7 +390,6 @@ class Trainer:
             reduction='mean'
         )
 
-        loss = loss / self.gradient_accumulation_steps
         return loss
 
     def _backprop(self, grad_clip_value):
@@ -412,6 +411,8 @@ class Trainer:
             labels=self.labels,
             attention_mask=self.attention_mask
         )
+
+        loss = loss / self.gradient_accumulation_steps
 
         if self.use_amp and self.scaler is not None:
             self.scaler.scale(loss).backward()
