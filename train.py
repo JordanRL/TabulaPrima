@@ -679,7 +679,7 @@ def main():
         # Learning rate scheduler
         target_tokens = total_params * 10
         total_steps = target_tokens // (train_dataset.total_tokens / (len(train_dataloader) // args.grad_acc_steps))
-        eval_interval = total_steps / 100
+        eval_interval = 100
 
         # Training configuration info
         print(Colors.info(f"  • Batch size: {Colors.highlight(str(args.batch_size))} (effective: {Colors.highlight(str(args.batch_size * args.grad_acc_steps))})"))

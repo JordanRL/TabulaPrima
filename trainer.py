@@ -60,7 +60,7 @@ class Trainer:
             model_dir="models",
             use_amp=False,
             log_interval=10,
-            eval_interval=1000,
+            eval_interval=100,
             global_steps=None,
             wandb=None,
             allow_mp_switch=False,
