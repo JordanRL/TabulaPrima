@@ -93,319 +93,274 @@ def parse_args():
 
     return parser.parse_args()
 
+# Define RoPE dimension per head (d_h^R in paper)
+# Let's use the user's original rope_dim calculation for this example
+ROPE_HEAD_DIM = HEAD_DIM // 4 # e.g., 128 // 4 = 32
 
-# More stable RoPE implementation that still preserves partial application
+# Define compressed content head dimension (d_h^C)
+COMPRESSED_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM # e.g., 128 - 32 = 96
+
+# Define latent dimensions (d_c for KV, d'_c for Q in paper)
+# Let's assume they are the same for simplicity, using user's MLA_LATENT_DIM
+KV_LATENT_DIM = 288 # d_c
+Q_LATENT_DIM = 288 # d'_c (can be different)
+
+# --- RotaryEmbedding Class (Mostly unchanged, ensure dim matches ROPE_HEAD_DIM) ---
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=MAX_SEQ_LENGTH):
+    def __init__(self, dim=ROPE_HEAD_DIM, max_seq_len=MAX_SEQ_LENGTH, base=10000):
         super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
         # Initialize frequency bands - standard RoPE implementation
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq)
 
         # Pre-compute embeddings for all possible positions up to max_seq_len
-        position = torch.arange(0, max_seq_len, dtype=torch.float)
-        freqs = torch.outer(position, inv_freq)
+        self._set_cos_sin_cache(max_seq_len)
 
-        # Complex number encoding in the frequency domain
-        # Use 2D representation [cos, sin] instead of complex numbers
+    def _set_cos_sin_cache(self, seq_len):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(seq_len, dtype=self.inv_freq.dtype, device=self.inv_freq.device)
+        freqs = torch.outer(t, self.inv_freq)
+        # Different from paper, but equivalent to complex number representation
         emb = torch.cat((freqs, freqs), dim=-1)
+        # Cache cos and sin embeddings
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-        # Cache sin and cos values - shape [max_seq_len, dim]
-        self.register_buffer("cos_cached", emb.cos())
-        self.register_buffer("sin_cached", emb.sin())
-
-        self.max_seq_len = max_seq_len
-
-    def forward(self, x, seq_len=None):
+    def forward(self, seq_len):
         """
-        Get rotary embeddings for the sequence.
-
+        Return cos and sin embeddings for a given sequence length.
         Args:
-            x: Not used except for shape inference in some implementations
-            seq_len: Sequence length to return embeddings for
-
+            seq_len: The sequence length to get embeddings for.
         Returns:
             Tuple of (cos, sin) of shape [seq_len, dim]
         """
-        if seq_len is None:
-            seq_len = min(x.shape[1], self.max_seq_len)
+        if seq_len > self.max_seq_len_cached:
+             self._set_cos_sin_cache(seq_len)
 
-        if seq_len > self.max_seq_len:
-            # Handle longer sequences by recomputing
-            position = torch.arange(0, seq_len, dtype=torch.float, device=self.cos_cached.device)
-            freqs = torch.outer(position, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            return emb.cos(), emb.sin()
+        return (
+            self.cos_cached[:seq_len],
+            self.sin_cached[:seq_len],
+        )
 
-        # Return cached values
-        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
-
+# --- New RoPE Application Function (Standard Implementation) ---
 def rotate_half(x):
-    x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-
-def apply_rotary_pos_emb_partial(q, cos, sin, position_ids=None, rope_dim=None):
+def apply_rotary_pos_emb(x, cos, sin, position_ids):
     """
-    Apply rotary positional embeddings to a subset of dimensions of q.
+    Applies Rotary Position Embedding to the input tensor x.
 
     Args:
-        q: Query tensor of shape [..., head_dim]
-        cos, sin: Positional encodings [seq_len, dim]
-        position_ids: Optional custom position ids
-        rope_dim: Dimension to apply RoPE to (a subset of head_dim)
+        x (torch.Tensor): Input tensor, shape or.
+        cos (torch.Tensor): Cosine embeddings, shape.
+        sin (torch.Tensor): Sine embeddings, shape.
+        position_ids (torch.Tensor): Position indices, shape.
 
     Returns:
-        q with RoPE applied to the rope_dim dimensions
+        torch.Tensor: Tensor with RoPE applied.
     """
-    # Ensure proper dimensions
-    # The shape of q could be [batch, seq_len, heads, head_dim]
-    # or just [batch, seq_len, 1, head_dim] for key_rope
-    original_shape = q.shape
+    # cos/sin: ->
+    cos = cos[position_ids].unsqueeze(2) #
+    sin = sin[position_ids].unsqueeze(2) #
 
-    # Get the last dimension size (head_dim)
-    head_dim = original_shape[-1]
+    # Handle head dimension broadcasting if x has heads
+    # and cos/sin are
+    # Or if x is shared key and cos/sin are
+    # This unsqueeze handles both cases correctly due to broadcasting rules.
 
-    # If rope_dim is not specified, default to the full dimension
-    if rope_dim is None:
-        rope_dim = head_dim
+    rotated_x = (x * cos) + (rotate_half(x) * sin)
+    return rotated_x
 
-    # If rope_dim equals head_dim, apply RoPE to the entire tensor
-    if rope_dim == head_dim:
-        q_rope = q
-        q_pass = None
-    else:
-        # Split into RoPE part and non-RoPE part
-        q_rope = q[..., :rope_dim]
-        q_pass = q[..., rope_dim:]
 
-    # Handle sequence length
-    if position_ids is None:
-        if len(original_shape) >= 2:
-            seq_len = original_shape[-3] if len(original_shape) >= 3 else original_shape[-2]
-            position_ids = torch.arange(seq_len, device=q.device)
-
-    # Ensure rope dimensions are even (required for rotation in pairs)
-    if rope_dim % 2 != 0:
-        raise ValueError(f"RoPE dimension {rope_dim} must be even")
-
-    # We need to work with pairs of values, so we reshape
-    half_rope_dim = rope_dim // 2
-    q_rope_reshaped = q_rope.view(*original_shape[:-1], half_rope_dim, 2)
-
-    # Get the cos and sin values for specific positions
-    if position_ids is not None:
-        # Extract the appropriate cos/sin values for the given positions
-        cos_pos = cos.index_select(0, position_ids.flatten()).view(position_ids.shape + (cos.size(-1),))
-        sin_pos = sin.index_select(0, position_ids.flatten()).view(position_ids.shape + (sin.size(-1),))
-    else:
-        cos_pos = cos
-        sin_pos = sin
-
-    # Reshape to make broadcasting work properly
-    cos_pos = cos_pos[..., :half_rope_dim]
-    sin_pos = sin_pos[..., :half_rope_dim]
-
-    # Reshape to match q's shape for broadcasting
-    for _ in range(len(original_shape) - len(cos_pos.shape) - 1):
-        cos_pos = cos_pos.unsqueeze(-2)
-        sin_pos = sin_pos.unsqueeze(-2)
-
-    # Apply rotation - the rotary operation happens in pairs
-    cos_pos = cos_pos.unsqueeze(-1)  # Add last dim for the pair values
-    sin_pos = sin_pos.unsqueeze(-1)
-
-    # Apply the rotation formula
-    q_rope_out = torch.empty_like(q_rope_reshaped)
-    q_rope_out[..., 0] = q_rope_reshaped[..., 0] * cos_pos - q_rope_reshaped[..., 1] * sin_pos
-    q_rope_out[..., 1] = q_rope_reshaped[..., 0] * sin_pos + q_rope_reshaped[..., 1] * cos_pos
-
-    # Reshape back to original dimensions
-    q_rope_out = q_rope_out.view(*original_shape[:-1], rope_dim)
-
-    # Combine with non-RoPE part if needed
-    if q_pass is not None:
-        q_out = torch.cat([q_rope_out, q_pass], dim=-1)
-    else:
-        q_out = q_rope_out
-
-    return q_out
-
-# Multi-head Latent Attention implementation
+# --- Corrected MultiHeadLatentAttention Class (DeepSeek V2 Aligned) ---
 class MultiHeadLatentAttention(nn.Module):
-    def __init__(self, hidden_dim, num_heads, latent_dim, rope_dim=None, dropout=0.1):
+    def __init__(self,
+                 hidden_dim=HIDDEN_DIM,
+                 num_heads=NUM_HEADS,
+                 kv_latent_dim=KV_LATENT_DIM,
+                 q_latent_dim=Q_LATENT_DIM,
+                 rope_head_dim=ROPE_HEAD_DIM,
+                 dropout=DROPOUT,
+                 max_seq_len=MAX_SEQ_LENGTH):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.latent_dim = latent_dim
+        self.kv_latent_dim = kv_latent_dim # d_c
+        self.q_latent_dim = q_latent_dim   # d'_c
+        self.rope_head_dim = rope_head_dim # d_h^R
 
-        # Set rope_dim (dimensions for positional encoding)
-        if rope_dim is not None:
-            self.rope_dim = rope_dim
-        else:
-            # Default to 1/4 of head_dim as a reasonable value
-            self.rope_dim = self.head_dim // 4
+        # Calculate compressed content head dimension
+        self.head_dim = hidden_dim // num_heads # Full head dim (d_h = d_h^C + d_h^R)
+        self.compressed_head_dim = self.head_dim - self.rope_head_dim # d_h^C
 
-        # Content dimensions (non-RoPE parts)
-        self.content_dim = self.head_dim - self.rope_dim
+        if self.compressed_head_dim <= 0:
+             raise ValueError("Rope head dimension must be smaller than the full head dimension.")
 
-        # Query projections
-        # Step 1: Project into latent space
-        self.q_down_proj = nn.Linear(hidden_dim, latent_dim, bias=False)
+        # --- Projections based on DeepSeek V2 Equations ---
+        # Eq (9): KV Down-projection (Shared)
+        self.kv_down_proj = nn.Linear(hidden_dim, kv_latent_dim, bias=False) # W_DKV
 
-        # Step 2a: Project latent to content space (non-RoPE part)
-        self.q_up_proj = nn.Linear(latent_dim, self.content_dim * num_heads, bias=False)
+        # Eq (12): Query Down-projection
+        self.q_down_proj = nn.Linear(hidden_dim, q_latent_dim, bias=False) # W_DQ
 
-        # Step 2b: Project latent to RoPE space
-        self.q_rope_proj = nn.Linear(latent_dim, self.rope_dim * num_heads, bias=False)
+        # Eq (10): Key Up-projection (Compressed Content Part)
+        self.k_c_proj = nn.Linear(kv_latent_dim, self.compressed_head_dim * num_heads, bias=False) # W_UK (output dim d_h^C * n_h)
 
-        # Key-Value compression to latent space
-        self.kv_down_proj = nn.Linear(hidden_dim, latent_dim, bias=False)
+        # Eq (11): Value Up-projection (Compressed Content Part)
+        self.v_proj = nn.Linear(kv_latent_dim, self.head_dim * num_heads, bias=False) # W_UV (output dim d_h * n_h)
 
-        # Key projections
-        # For content part (non-RoPE)
-        self.k_up_proj = nn.Linear(latent_dim, self.content_dim * num_heads, bias=False)
+        # Eq (13): Query Up-projection (Compressed Content Part)
+        self.q_c_proj = nn.Linear(q_latent_dim, self.compressed_head_dim * num_heads, bias=False) # W_UQ (output dim d_h^C * n_h)
 
-        # For RoPE part - shared across heads to save memory
-        self.k_rope_proj = nn.Linear(hidden_dim, self.rope_dim, bias=False)
+        # Eq (15): RoPE Key Projection (from hidden_state, shared across heads)
+        self.k_r_proj = nn.Linear(hidden_dim, self.rope_head_dim, bias=False) # W_KR (output dim d_h^R)
 
-        # Value projection from latent
-        self.v_up_proj = nn.Linear(latent_dim, hidden_dim, bias=False)
+        # Eq (14): RoPE Query Projection (from query latent)
+        self.q_r_proj = nn.Linear(q_latent_dim, self.rope_head_dim * num_heads, bias=False) # W_QR (output dim d_h^R * n_h)
 
         # Output projection
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
-        # Rotary embeddings
-        self.rotary_emb = RotaryEmbedding(self.rope_dim)
+        # Rotary embeddings (initialized with RoPE dimension d_h^R)
+        self.rotary_emb = RotaryEmbedding(dim=self.rope_head_dim, max_seq_len=max_seq_len)
 
-        # Flag for optimized generation
+        # Flags/Buffers for potential future matrix absorption implementation
         self.generation_ready = False
         self.use_absorption = False
-        self.register_buffer('q_fused_weight', None)
-        self.register_buffer('q_rope_fused_weight', None)
+        # Register buffers for absorbed weights (logic to compute/use them is NOT implemented here)
+        self.register_buffer('q_absorbed_weight', None) # Would absorb W_UK
+        self.register_buffer('o_absorbed_weight', None) # Would absorb W_UV
 
-    def forward(self, x, past_key_value=None, attention_mask=None, is_causal=True, use_cache=False):
+    def forward(self, x, past_key_value=None, attention_mask=None, position_ids=None, is_causal=True, use_cache=False):
         batch_size, seq_len, _ = x.shape
 
-        # === QUERY PATH ===
-        # Project to latent space
-        q_latent = self.q_down_proj(x)
+        # --- Compute Latent Vectors ---
+        # Eq (9): Shared KV Latent (for current step)
+        c_kv_cur = self.kv_down_proj(x) # Shape:
+        # Eq (12): Query Latent (for current step)
+        c_q_cur = self.q_down_proj(x)   # Shape:
 
-        # Split into content and RoPE parts
-        q_c = self.q_up_proj(q_latent)
-        q_r = self.q_rope_proj(q_latent)
+        # --- Compute Compressed Components ---
+        # Eq (13): Compressed Query Content
+        q_c = self.q_c_proj(c_q_cur) # Shape:
+        q_c = q_c.view(batch_size, seq_len, self.num_heads, self.compressed_head_dim) # Shape:
 
-        # Reshape
-        q_c = q_c.view(batch_size, seq_len, self.num_heads, self.content_dim)
-        q_r = q_r.view(batch_size, seq_len, self.num_heads, self.rope_dim)
+        # Eq (14): RoPE Query Component (Before RoPE application)
+        q_r = self.q_r_proj(c_q_cur) # Shape:
+        q_r = q_r.view(batch_size, seq_len, self.num_heads, self.rope_head_dim) # Shape:
 
-        # === KEY-VALUE PATH ===
-        # Create latent for KV
-        kv_latent_cur = self.kv_down_proj(x)
+        # Eq (15): RoPE Key Component (Shared, Before RoPE application)
+        k_r_cur = self.k_r_proj(x) # Shape:
+        k_r_cur = k_r_cur.unsqueeze(2) # Add singleton head dim:
 
-        # Project content key
-        k_c_cur = self.k_up_proj(kv_latent_cur)
-        k_c_cur = k_c_cur.view(batch_size, seq_len, self.num_heads, self.content_dim)
-
-        # Project RoPE key directly from input (shared across heads)
-        k_r_cur = self.k_rope_proj(x)
-        k_r_cur = k_r_cur.view(batch_size, seq_len, 1, self.rope_dim)
-
-        # === GET POSITIONAL ENCODING ===
+        # --- Apply RoPE ---
         past_length = 0
         if past_key_value is not None:
-            past_length = past_key_value[2]
+            # Cache structure: (c_kv_cache, k_r_cache, past_length)
+            past_length = past_key_value[1]
 
-        # Get rotary embeddings - this returns cos/sin of shape [seq_len, rope_dim]
-        cos, sin = self.rotary_emb(x, seq_len=seq_len + past_length)
+        # Get cos/sin for the combined sequence length
+        cos, sin = self.rotary_emb(seq_len=past_length + seq_len) # Shape:
 
-        # === APPLY ROTARY EMBEDDINGS TO QUERY AND KEY ROTARY PARTS ===
-        # Get current sequence slice
-        position_ids = torch.arange(past_length, past_length + seq_len, device=x.device)
+        # Create position_ids if not provided
+        if position_ids is None:
+             position_ids = torch.arange(past_length, past_length + seq_len, dtype=torch.long, device=x.device)
+             position_ids = position_ids.unsqueeze(0).view(-1, seq_len) # Shape:
 
-        # Apply to query RoPE part - this now returns just q_r
-        q_r = apply_rotary_pos_emb_partial(
-            q_r,
-            cos, sin,
-            position_ids=position_ids,
-            rope_dim=self.rope_dim
-        )
+        # Apply RoPE to q_r and k_r_cur using the correct positions
+        q_r = apply_rotary_pos_emb(q_r, cos, sin, position_ids) # Shape:
+        k_r_cur_rope = apply_rotary_pos_emb(k_r_cur, cos, sin, position_ids) # Shape:
 
-        # Apply to key RoPE part - this now returns just k_r_cur
-        k_r_cur = apply_rotary_pos_emb_partial(
-            k_r_cur,
-            cos, sin,
-            position_ids=position_ids,
-            rope_dim=self.rope_dim
-        )
+        # --- KV Cache Handling ---
+        if use_cache:
+            if past_key_value is not None:
+                c_kv_cache, k_r_cache, _ = past_key_value
+                # Concatenate current items with cache
+                c_kv = torch.cat([c_kv_cache, c_kv_cur], dim=1) # Shape:
+                k_r_rope = torch.cat([k_r_cache, k_r_cur_rope], dim=1) # Shape:
+            else:
+                c_kv = c_kv_cur
+                k_r_rope = k_r_cur_rope
 
-        # === CACHE HANDLING AND REST OF ATTENTION ===
-        # Continue with the rest of your existing implementation...
-        if past_key_value is not None:
-            kv_latent_past, k_r_past, _ = past_key_value
-            kv_latent = torch.cat([kv_latent_past, kv_latent_cur], dim=1)
-            k_r = torch.cat([k_r_past, k_r_cur], dim=1)
+            # Store updated cache: (latent_kv, rope_key, current_length)
+            present_key_value = (c_kv, k_r_rope, past_length + seq_len)
             curr_seq_len = past_length + seq_len
         else:
-            kv_latent = kv_latent_cur
-            k_r = k_r_cur
+            # Not using cache, use current values only
+            c_kv = c_kv_cur
+            k_r_rope = k_r_cur_rope
+            present_key_value = None
             curr_seq_len = seq_len
 
-        # Project content key from latent
-        k_c = self.k_up_proj(kv_latent)
-        k_c = k_c.view(batch_size, curr_seq_len, self.num_heads, self.content_dim)
+        # --- Compute Full K and V (Explicitly, for non-absorbed inference/training) ---
+        # NOTE: In a fully optimized MLA inference with matrix absorption,
+        # k_c and v would NOT be explicitly computed here. The attention
+        # calculation would use c_kv directly with absorbed matrices.
 
-        # Expand RoPE key part to all heads
-        k_r = k_r.expand(batch_size, curr_seq_len, self.num_heads, self.rope_dim)
+        # Eq (10): Compressed Key Content (from potentially cached c_kv)
+        k_c = self.k_c_proj(c_kv) # Shape:
+        k_c = k_c.view(batch_size, curr_seq_len, self.num_heads, self.compressed_head_dim) # Shape:
 
-        # Project value from latent
-        v = self.v_up_proj(kv_latent)
-        v = v.view(batch_size, curr_seq_len, self.num_heads, self.head_dim)
+        # Eq (11): Compressed Value (from potentially cached c_kv)
+        v = self.v_proj(c_kv) # Shape:
+        v = v.view(batch_size, curr_seq_len, self.num_heads, self.head_dim) # Shape:
 
-        # Combine content and RoPE parts for queries and keys
-        q = torch.cat([q_c, q_r], dim=-1).transpose(1, 2)  # [B, H, S, D]
-        k = torch.cat([k_c, k_r], dim=-1).transpose(1, 2)  # [B, H, C, D]
-        v = v.transpose(1, 2)  # [B, H, C, D]
+        # --- Prepare for Attention ---
+        # Eq (16): Concatenate final Query
+        q = torch.cat([q_c, q_r], dim=-1) # Shape:
 
-        # === ATTENTION CALCULATION ===
-        # Compute attention scores
+        # Eq (17): Concatenate final Key
+        # Expand shared k_r_rope to all heads: ->
+        k_r_rope_expanded = k_r_rope.expand(batch_size, curr_seq_len, self.num_heads, self.rope_head_dim)
+        k = torch.cat([k_c, k_r_rope_expanded], dim=-1) # Shape:
+
+        # Transpose for attention calculation:
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # --- Attention Calculation (Standard Scaled Dot-Product) ---
+        # Note: q shape is, k shape is
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
         # Apply causal mask if needed
         if is_causal:
+            # Create mask for the full sequence length
             causal_mask = torch.triu(torch.ones(curr_seq_len, curr_seq_len,
                                                 dtype=torch.bool, device=x.device), diagonal=1)
-
+            # If using cache, only mask the new query tokens against the full key sequence
             if past_length > 0:
-                causal_mask = causal_mask[-seq_len:, :]
+                 # Select the rows corresponding to the new query tokens
+                 causal_mask_slice = causal_mask[past_length:, :] # Shape
+            else:
+                 causal_mask_slice = causal_mask # Shape
 
-            # Reshape mask for broadcasting with scores [B, H, S, C]
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-            scores.masked_fill_(causal_mask, -10000.0)
+            # Reshape mask for broadcasting: ->
+            causal_mask_slice = causal_mask_slice.unsqueeze(0).unsqueeze(0)
+            # Apply mask to scores (shape)
+            scores = scores.masked_fill(causal_mask_slice, torch.finfo(scores.dtype).min)
 
-        # Apply attention mask with proper shape
+
+        # Apply external attention mask (e.g., for padding)
         if attention_mask is not None:
-            # Reshape and expand attention mask as needed
-            if attention_mask.dim() == 2:
-                # [B, S] -> [B, 1, S, 1]
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(-1)
-
-            # Expand to match scores dimensions
-            attention_mask = attention_mask.expand(-1, -1, -1, curr_seq_len)
-
-            # Expand head dimension if needed
-            if attention_mask.size(1) == 1 and scores.size(1) > 1:
-                attention_mask = attention_mask.expand(-1, self.num_heads, -1, -1)
-
+            # Expected shape or
+            if attention_mask.dim() == 2: # -> ->
+                attention_mask = attention_mask[:, None, :, None].expand(-1, -1, -1, curr_seq_len)
+            # Add mask values (0 for attend, -inf for ignore)
             scores = scores + attention_mask
 
         # Apply softmax and compute weighted sum
-        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype) # Use float32 for stability
         attn_weights = self.dropout(attn_weights)
 
-        context = torch.matmul(attn_weights, v)
+        context = torch.matmul(attn_weights, v) # Shape:
 
         # Reshape back
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_dim)
@@ -413,36 +368,43 @@ class MultiHeadLatentAttention(nn.Module):
         # Output projection
         output = self.out_proj(context)
 
-        # Return with cache if requested
         if use_cache:
-            return output, (kv_latent, k_r, curr_seq_len)
+            return output, present_key_value
         else:
-            return output
+            return output, None # Return None for cache when not used
 
     def prepare_for_generation(self):
-        """Optimize matrices for faster inference during generation"""
+        """
+        Placeholder for computing absorbed matrices for optimized inference.
+        Actual computation logic needs to be implemented based on matrix
+        absorption principles for the DeepSeek V2 MLA structure.
+        """
         if self.generation_ready:
             return
 
+        # --- TODO: Implement computation of absorbed matrices ---
+        # Example (Conceptual - requires actual derivation):
+        # q_absorbed_weight = compute_absorbed_q_weight(self.q_down_proj, self.q_c_proj, self.k_c_proj)
+        # o_absorbed_weight = compute_absorbed_o_weight(self.v_proj, self.out_proj)
+        # self.register_buffer('q_absorbed_weight', q_absorbed_weight)
+        # self.register_buffer('o_absorbed_weight', o_absorbed_weight)
+
         self.generation_ready = True
+        print("Warning: Matrix absorption computation in prepare_for_generation is not implemented.")
 
-        # Precompute fused matrices
-        q_fused_weight = torch.matmul(
-            self.q_up_proj.weight,
-            self.q_down_proj.weight
-        )
-        self.register_buffer('q_fused_weight', q_fused_weight)
-
-        # Fuse RoPE query projections
-        q_rope_fused_weight = torch.matmul(
-            self.q_rope_proj.weight,
-            self.q_down_proj.weight
-        )
-        self.register_buffer('q_rope_fused_weight', q_rope_fused_weight)
 
     def set_use_absorption(self, use_absorption):
-        """Toggle whether to use matrix absorption during inference"""
-        self.use_absorption = use_absorption
+        """Toggle whether to use matrix absorption during inference (if implemented)."""
+        if use_absorption and not self.generation_ready:
+             print("Warning: Cannot use absorption, matrices not prepared. Call prepare_for_generation first.")
+             self.use_absorption = False
+        elif use_absorption and self.q_absorbed_weight is None:
+             print("Warning: Cannot use absorption, absorbed matrices not computed.")
+             self.use_absorption = False
+        else:
+             self.use_absorption = use_absorption
+             if use_absorption:
+                  print("Note: Using matrix absorption requires the forward pass to be modified.")
 
 
 # Feed-forward network
@@ -469,7 +431,8 @@ class TransformerLayer(nn.Module):
         self.attention = MultiHeadLatentAttention(
             hidden_dim=hidden_dim,
             num_heads=num_heads,
-            latent_dim=latent_dim,
+            kv_latent_dim=latent_dim,
+            q_latent_dim=latent_dim,
             dropout=dropout
         )
         self.norm1 = nn.LayerNorm(hidden_dim)
