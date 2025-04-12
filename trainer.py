@@ -63,6 +63,7 @@ class Trainer:
             eval_interval=1000,
             global_steps=None,
             wandb=None,
+            allow_mp_switch=False,
     ):
         self.model = model
         self.train_dataloader = train_dataloader
@@ -81,7 +82,7 @@ class Trainer:
         self.global_steps = global_steps or len(train_dataloader)
         self.target_tokens = total_parameters * 10
         self.wandb = wandb
-        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
+        self.scaler = torch.amp.GradScaler() if self.use_amp else None
         self.input_ids = None
         self.attention_mask = None
         self.labels = None
@@ -103,6 +104,7 @@ class Trainer:
         self.use_cache = False
         self.stability_steps = 0
         self.stability_reached = False
+        self.allow_mp_switch = allow_mp_switch
 
     def run(self):
         self.model.train()
@@ -162,10 +164,17 @@ class Trainer:
                     self.steps_since_instrument += 1
 
                     self._backprop(grad_clip_value=grad_clip_value)
-                    if self.use_amp == False and self.stability_reached == True:
-                        self.use_amp = True
-                        progress_bar.desc = f"Pretrain [{self.run_phase.title()}] ({self._precision_mode()})"
-                        self.scaler = torch.amp.GradScaler('cuda')
+                    if self.run_phase == "warmup" and self.stability_reached == True:
+                        self.run_phase = "core learning"
+                        mode = self._precision_mode() if self.allow_mp_switch else "FP32"
+                        progress_bar.desc = f"Pretrain [{self.run_phase.title()}] ({mode})"
+
+                        if self.use_amp == False and self.allow_mp_switch:
+                            self.use_amp = True
+                            if self._precision_mode() == "FP16":
+                                self.scaler = torch.amp.GradScaler()
+                            else:
+                                self.scaler = None
                     # Clear CUDA cache periodically to prevent fragmentation
                     # if inference_steps // gradient_accumulation_steps % empty_cache_interval == 0:
                     #    torch.cuda.empty_cache()
@@ -354,7 +363,7 @@ class Trainer:
         return loss
 
     def _backprop(self, grad_clip_value):
-        if self.use_amp:
+        if self.use_amp and self.scaler is not None:
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_value)
             self.scaler.step(self.optimizer)
@@ -373,7 +382,7 @@ class Trainer:
             attention_mask=self.attention_mask
         )
 
-        if self.use_amp:
+        if self.use_amp and self.scaler is not None:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
@@ -394,15 +403,16 @@ class Trainer:
         return logits, loss
 
     def _precision_phase(self):
-        if self.pre_clip_grad_norm < 1.5:
+        if self.stability_reached:
+            return None
+        if self.pre_clip_grad_norm < 1.0:
             self.stability_steps += 1
         else:
             self.stability_steps = 0
 
-        if self.stability_steps >= self.gradient_accumulation_steps:
+        if self.stability_steps >= self.gradient_accumulation_steps and self.stability_reached == False:
             f16_dtype = "BF16" if torch.cuda.is_bf16_supported() else "FP16"
             self.stability_reached = True
-            self.run_phase = "core learning"
             print(Colors.success(f"\n  🎉 Stability Reached! Switching to {f16_dtype}. 🎉"))
 
     def _update_metrics(self, loss):

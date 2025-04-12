@@ -440,6 +440,33 @@ class MLATransformer(nn.Module):
         # Flag for generation optimization
         self.generation_ready = False
 
+    def set_layer_bf16(self, i: int):
+        self.layers[i].bfloat16()
+
+    def set_layer_fp32(self, i: int):
+        self.layers[i].float32()
+
+    def set_layer_fp16(self, i: int):
+        self.layers[i].float16()
+
+    def set_layer_attention_bf16(self, i: int):
+        self.layers[i].attention.bfloat16()
+
+    def set_layer_attention_fp32(self, i: int):
+        self.layers[i].attention.float32()
+
+    def set_layer_attention_fp16(self, i: int):
+        self.layers[i].attention.float16()
+
+    def set_layer_ff_bf16(self, i: int):
+        self.layers[i].ff.bfloat16()
+
+    def set_layer_ff_fp32(self, i: int):
+        self.layers[i].ff.float32()
+
+    def set_layer_ff_fp16(self, i: int):
+        self.layers[i].ff.float16()
+
     def _init_weights(self, module):
         """Initialize the weights - critical for stable training"""
         if isinstance(module, nn.Linear):

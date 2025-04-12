@@ -77,7 +77,7 @@ def parse_args():
     # Dataset arguments
     parser.add_argument("--dataset", type=str, default="wikitext", help="Dataset path (e.g., wikitext)")
     parser.add_argument("--dataset-name", type=str, default="wikitext-103-raw-v1", help="Dataset name")
-    parser.add_argument("--run-name", type=str, default="WikiText103", help="The base name of the run in W&B")
+    parser.add_argument("--run-name", type=str, default="WikiText", help="The base name of the run in W&B")
     parser.add_argument("--cache-dir", type=str, default="dataset_cache", help="Directory to store cached datasets")
     parser.add_argument("--no-cache", action="store_true", help="Disable dataset caching")
     parser.add_argument("--clear-cache", action="store_true", help="Clear existing cache before training")
@@ -92,6 +92,7 @@ def parse_args():
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--model-dir", type=str, default="models", help="Directory to save final model")
     parser.add_argument("--use-checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
+    parser.add_argument("--allow-amp-switchover", action="store_true", help="Allows the training run to switch over to mixed precision once it reaches stability")
 
     return parser.parse_args()
 
@@ -791,6 +792,7 @@ def main():
                 job_type="training",
                 tags=["experiment","generic-dataset","pretraining"],
                 config={
+                    "job_name": args.run_name+"-"+datetime.datetime.now().strftime("%b%d"),
                     "parameters": total_params,
                     "batch_size": args.batch_size,
                     "learning_rate": args.learning_rate,
@@ -833,6 +835,7 @@ def main():
                 eval_interval=eval_interval,
                 global_steps=total_steps,
                 wandb=wandb,
+                allow_mp_switch=args.allow_mp_switchover,
             )
             run_status = "training"
             trained_tokens, run_status = trainer.run()
