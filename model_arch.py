@@ -1,22 +1,9 @@
-import argparse
 import math
-import sys
-import datetime
-import pickle
-import hashlib
-import traceback
-from traceback import FrameSummary
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
-import os
-import time
-from tqdm import tqdm
-import wandb  # Optional for logging
-from datasets import load_dataset
+from torch.utils.checkpoint import checkpoint
 
 # --- RotaryEmbedding Class (Mostly unchanged, ensure dim matches ROPE_HEAD_DIM) ---
 class RotaryEmbedding(nn.Module):
@@ -339,14 +326,14 @@ class FeedForward(nn.Module):
 
 # Transformer Layer with MLA
 class TransformerLayer(nn.Module):
-    def __init__(self, hidden_dim, num_heads, ff_dim, latent_dim, dropout, max_seq_len):
+    def __init__(self, hidden_dim, num_heads, ff_dim, latent_dim, dropout, max_seq_len, use_checkpointing=False):
         super().__init__()
         self.attention = MultiHeadLatentAttention(
             hidden_dim=hidden_dim,
             num_heads=num_heads,
             kv_latent_dim=latent_dim,
             q_latent_dim=latent_dim,
-            rope_head_dim=(hidden_dim//num_heads)//4,
+            rope_head_dim=(hidden_dim // num_heads) // 4,
             dropout=dropout,
             max_seq_len=max_seq_len,
         )
@@ -354,24 +341,51 @@ class TransformerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.ff = FeedForward(hidden_dim, ff_dim, dropout)
         self.dropout = nn.Dropout(dropout)
+        self.use_checkpointing = use_checkpointing
 
-    def forward(self, x, attention_mask=None, past_key_value=None, use_cache=False, position_ids=None):
-        # First sublayer: MLA with residual connection
-        # Pass the normalized input and attention mask to MLA
-        normalized_x = self.norm1(x)
-
-        attn_output, present_key_value = self.attention(
+    def _attention_block(self, normalized_x, attention_mask, position_ids, past_key_value, use_cache):
+        return self.attention(
             normalized_x,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
-            use_cache=True
+            use_cache=use_cache
         )
+
+    def _ff_block(self, x):
+        return self.ff(self.norm2(x))
+
+    def forward(self, x, attention_mask=None, past_key_value=None, use_cache=False, position_ids=None):
+        # First sublayer: MLA with residual connection
+        normalized_x = self.norm1(x)
+
+        if self.use_checkpointing and not use_cache and self.training:
+            # Use checkpointing for attention if not using KV cache
+            attn_output, _ = checkpoint(
+                self._attention_block,
+                normalized_x, attention_mask, position_ids, None, False,
+                use_reentrant=False,
+            )
+            # No KV cache with checkpointing
+            present_key_value = None
+        else:
+            # Regular forward pass with potential KV cache
+            attn_output, present_key_value = self.attention(
+                normalized_x,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                use_cache=use_cache
+            )
 
         x = x + self.dropout(attn_output)
 
         # Second sublayer: FFN with residual connection
-        ff_output = self.ff(self.norm2(x))
+        if self.use_checkpointing and self.training:
+            ff_output = checkpoint(self._ff_block, x, use_reentrant=False)
+        else:
+            ff_output = self.ff(self.norm2(x))
+
         x = x + self.dropout(ff_output)
 
         if use_cache:
@@ -391,15 +405,26 @@ class MLATransformer(nn.Module):
             ff_dim,
             latent_dim,
             dropout,
-            max_seq_len
+            max_seq_len,
+            use_checkpointing=False
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.embedding = nn.Embedding(vocab_size, hidden_dim)
+        self.use_checkpointing = use_checkpointing
+        self.num_heads = num_heads
 
         # Use torch.nn.ModuleList for better memory efficiency with checkpoint
         self.layers = nn.ModuleList([
-            TransformerLayer(hidden_dim, num_heads, ff_dim, latent_dim, dropout, max_seq_len)
+            TransformerLayer(
+                hidden_dim,
+                num_heads,
+                ff_dim,
+                latent_dim,
+                dropout,
+                max_seq_len,
+                use_checkpointing=use_checkpointing
+            )
             for _ in range(num_layers)
         ])
 

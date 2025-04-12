@@ -91,7 +91,7 @@ def parse_args():
     # Training arguments
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--model-dir", type=str, default="models", help="Directory to save final model")
-    parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision training")
+    parser.add_argument("--use-checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
 
     return parser.parse_args()
 
@@ -458,7 +458,6 @@ def main():
                       f"(effective: {Colors.highlight(str(args.batch_size * args.grad_acc_steps))})"))
     print(Colors.info(f"  • Learning Rate: {Colors.highlight(str(args.learning_rate))}"))
     print(Colors.info(f"  • Using Cache: {Colors.highlight('No' if args.no_cache else 'Yes')}"))
-    print(Colors.info(f"  • Mixed Precision: {Colors.highlight('No' if args.no_amp else 'Yes')}"))
 
     try:
         # Create cached datasets
@@ -613,6 +612,7 @@ def main():
                 latent_dim=MLA_LATENT_DIM,
                 dropout=DROPOUT,
                 max_seq_len=args.seq_length,
+                use_checkpointing=args.use_checkpointing
             )
             model.to(device)
         else:
@@ -829,9 +829,9 @@ def main():
                 total_parameters=total_params,
                 gradient_accumulation_steps=args.grad_acc_steps,
                 checkpoint_dir="checkpoints",
+                use_amp=False,
                 eval_interval=eval_interval,
                 global_steps=total_steps,
-                use_amp=not args.no_amp,
                 wandb=wandb,
             )
             run_status = "training"

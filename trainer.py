@@ -58,7 +58,7 @@ class Trainer:
             max_grad_norm=1.0,
             checkpoint_dir="checkpoints",
             model_dir="models",
-            use_amp=True,
+            use_amp=False,
             log_interval=10,
             eval_interval=1000,
             global_steps=None,
@@ -113,7 +113,7 @@ class Trainer:
         # Tracking training dynamics
         start_time = time.time()
         last_checkpoint_time = start_time
-        progress_bar = tqdm(total=self.target_tokens, desc=f"Pretrain")
+        progress_bar = tqdm(total=self.target_tokens, desc=f"Pretrain [{self.run_phase.title()}] ({self._precision_mode()})", unit="tokens", colour="#4B6BFF")
         eval_interval_steps = max(1, self.eval_interval)
 
         while self.total_tokens < self.target_tokens:
@@ -164,6 +164,8 @@ class Trainer:
                     self._backprop(grad_clip_value=grad_clip_value)
                     if self.use_amp == False and self.stability_reached == True:
                         self.use_amp = True
+                        progress_bar.desc = f"Pretrain [{self.run_phase.title()}] ({self._precision_mode()})"
+                        self.scaler = torch.amp.GradScaler('cuda')
                     # Clear CUDA cache periodically to prevent fragmentation
                     # if inference_steps // gradient_accumulation_steps % empty_cache_interval == 0:
                     #    torch.cuda.empty_cache()
@@ -228,6 +230,10 @@ class Trainer:
 
                 if self.total_tokens >= self.target_tokens:
                     break
+
+                if self.run_phase == "core learning" and self.total_tokens >= self.target_tokens*0.8:
+                    self.run_phase = "refinement"
+                    progress_bar.desc = f"Pretrain [{self.run_phase.title()}] ({self._precision_mode()})"
 
                 if (time.time() - last_checkpoint_time) >= self.checkpoint_interval:
                     self.save_checkpoint()
@@ -392,7 +398,7 @@ class Trainer:
         if self.stability_steps >= self.gradient_accumulation_steps:
             f16_dtype = "BF16" if torch.cuda.is_bf16_supported() else "FP16"
             self.stability_reached = True
-            self.run_phase = "core_learning"
+            self.run_phase = "core learning"
             print(Colors.success(f"\n  🎉 Stability Reached! Switching to {f16_dtype}. 🎉"))
 
     def _update_metrics(self, loss):
@@ -414,3 +420,9 @@ class Trainer:
         # Calculate current perplexity (exp of loss)
         self.current_loss = sum(self.loss_window) / len(self.loss_window)
         self.current_perplexity = math.exp(min(self.current_loss, 20)) if len(self.loss_window) > 1 else float('inf')
+
+    def _precision_mode(self):
+        if self.use_amp:
+            return "BF16" if torch.cuda.is_bf16_supported() else "FP16"
+        else:
+            return "FP32"
