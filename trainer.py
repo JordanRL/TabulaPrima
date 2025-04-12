@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import os
 import time
 from tqdm import tqdm
+import numpy as np
 
 
 # Console colors for better readability
@@ -106,6 +107,8 @@ class Trainer:
         self.stability_steps = 0
         self.stability_reached = False
         self.allow_amp_switch = allow_amp_switch
+        self.test_accuracy_history = []
+        self.test_loss_history = []
 
     def run(self):
         self.model.train()
@@ -186,6 +189,7 @@ class Trainer:
                 progress_bar.update(self.input_ids.numel())
 
                 self._update_metrics(loss)
+                training_loss_decreasing = (self.loss_window[0] - self.loss_window[-1] > 0)
 
                 # Update progress bar
                 progress_bar.set_postfix({
@@ -216,6 +220,9 @@ class Trainer:
                     test_accuracy = eval_results['accuracy']
                     test_perplexity = eval_results['perplexity']
 
+                    self.test_accuracy_history.append(test_accuracy)
+                    self.test_loss_history.append(test_loss)
+
                     # Print intermediate results
                     #print(Colors.info(f"  • Eval loss: {Colors.highlight(f'{test_loss:.4f}')}"))
                     #print(Colors.info(f"  • Eval perplexity: {Colors.highlight(f'{test_perplexity:.2f}')}"))
@@ -238,6 +245,28 @@ class Trainer:
 
                 if len(log_dict) > 0:
                     self.wandb.log(log_dict)
+
+                if len(self.test_accuracy_history) > 2:
+                    best_acc_idx = np.argmax(np.array(self.test_accuracy_history))
+                    best_acc_shift = len(self.test_accuracy_history) - best_acc_idx
+                    curr_acc_diff = self.test_accuracy_history[best_acc_idx] - self.test_accuracy_history[-1]
+                    curr_acc_slope = self.test_accuracy_history[-1]/self.test_accuracy_history[-2]
+
+                    if self.test_accuracy_history[best_acc_idx] > 0.9:
+                        progress_bar.close()
+                        print(Colors.success(f"  🎉 Training finished early"))
+                        return self.total_tokens, "success"
+
+                    if (
+                        best_acc_shift > 2 and curr_acc_diff > 0.05
+                    ) or (
+                        best_acc_shift > 2 and curr_acc_slope < -0.1
+                    ):
+                        progress_bar.close()
+                        print(Colors.warning(f"  🛑 Training stopped: Validation is failing to improve"))
+                        self.wandb.alert(title="Training stopped", text="Training was terminated automatically due to validation stagnating")
+                        self.wandb.run.status = "stopped"
+                        return self.total_tokens, "terminated"
 
                 if self.total_tokens >= self.target_tokens:
                     break

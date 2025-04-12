@@ -955,6 +955,8 @@ def main():
         print(Colors.error(f"\n❌ Training process experienced an error ❌"))
     elif run_status == "stopped":
         print(Colors.warning(f"\n🚫 Training process was stopped manually 🚫"))
+    elif run_status == "terminated":
+        print(Colors.warning(f"\n🛑 Training process was stopped automatically 🛑"))
     else:
         print(Colors.success(f"\n✨ Training process completed successfully ✨"))
 
