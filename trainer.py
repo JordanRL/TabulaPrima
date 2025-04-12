@@ -270,7 +270,11 @@ class Trainer:
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
 
-                logits, loss = self._forward(input_ids, attention_mask, labels)
+                logits, loss = self._forward(
+                    input_ids=input_ids,
+                    labels=labels,
+                    attention_mask=attention_mask
+                )
 
                 # Calculate accuracy
                 flat_logits = logits.view(-1, logits.size(-1))
@@ -367,7 +371,11 @@ class Trainer:
         self.optimizer.zero_grad()
 
     def _bidirectional(self):
-        logits, loss = self._forward(self.input_ids, self.attention_mask, self.labels)
+        logits, loss = self._forward(
+            input_ids=self.input_ids,
+            labels=self.labels,
+            attention_mask=self.attention_mask
+        )
 
         if self.use_amp:
             self.scaler.scale(loss).backward()
