@@ -56,15 +56,21 @@ class Colors:
     def highlight(text):
         return f"{Colors.CYAN}{Colors.BOLD}{text}{Colors.ENDC}"
 
-# Constants for our 250M parameter model
+# Model defaults
 HIDDEN_DIM = 1152
 NUM_LAYERS = 12
 NUM_HEADS = 9
 HEAD_DIM = HIDDEN_DIM // NUM_HEADS
 FF_DIM = 4608
 MLA_LATENT_DIM = 288
-DROPOUT = 0.1
 MAX_SEQ_LENGTH = 512
+ROPE_HEAD_DIM = HEAD_DIM // 4
+COMPRESSED_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
+KV_LATENT_DIM = MLA_LATENT_DIM
+Q_LATENT_DIM = MLA_LATENT_DIM
+
+# Training defaults
+DROPOUT = 0.1
 VOCAB_SIZE = 50257  # GPT-2 tokenizer vocab size
 BATCH_SIZE = 1
 GRAD_STEPS = 8
@@ -98,15 +104,14 @@ def parse_args():
 
 # Define RoPE dimension per head (d_h^R in paper)
 # Let's use the user's original rope_dim calculation for this example
-ROPE_HEAD_DIM = HEAD_DIM // 4 # e.g., 128 // 4 = 32
+
 
 # Define compressed content head dimension (d_h^C)
-COMPRESSED_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM # e.g., 128 - 32 = 96
+ # e.g., 128 - 32 = 96
 
 # Define latent dimensions (d_c for KV, d'_c for Q in paper)
 # Let's assume they are the same for simplicity, using user's MLA_LATENT_DIM
-KV_LATENT_DIM = 288 # d_c
-Q_LATENT_DIM = 288 # d'_c (can be different)
+
 
 # Training Dataset
 class TextDataset(Dataset):
@@ -610,9 +615,11 @@ def main():
                 num_layers=NUM_LAYERS,
                 num_heads=NUM_HEADS,
                 ff_dim=FF_DIM,
-                latent_dim=MLA_LATENT_DIM,
+                kv_latent_dim=KV_LATENT_DIM,
+                q_latent_dim=Q_LATENT_DIM,
                 dropout=DROPOUT,
                 max_seq_len=args.seq_length,
+                rope_head_dim=ROPE_HEAD_DIM,
                 use_checkpointing=args.use_checkpointing
             )
             model.to(device)
@@ -793,13 +800,28 @@ def main():
                 tags=["experiment","generic-dataset","pretraining"],
                 config={
                     "job_name": args.run_name+"-"+datetime.datetime.now().strftime("%b%d"),
-                    "parameters": total_params,
-                    "batch_size": args.batch_size,
-                    "learning_rate": args.learning_rate,
-                    "gradient_accumulation_steps": args.grad_acc_steps,
-                    "optimizer": "Adam8Bit" if "8bit" in optimizer.__class__.__name__ else "AdamW",
+                    "model_def": {
+                        "parameters": total_params,
+                        "seq_length": args.seq_length,
+                        "hidden_dim": HIDDEN_DIM,
+                        "num_heads": NUM_HEADS,
+                        "num_layers": NUM_LAYERS,
+                        "head_dim": HEAD_DIM,
+                        "ff_dim": FF_DIM,
+                        "latent_dim": MLA_LATENT_DIM,
+                        "rope_head_dim": ROPE_HEAD_DIM,
+                    },
+                    "training_def": {
+                        "batch_size": args.batch_size,
+                        "learning_rate": args.learning_rate,
+                        "gradient_accumulation_steps": args.grad_acc_steps,
+                        "optimizer": "Adam8Bit" if "8bit" in optimizer.__class__.__name__ else "AdamW",
+                        "dropout": DROPOUT,
+                        "grad_checkpoints": args.use_checkpointing,
+                        "allow_amp_switch": args.allow_amp_switchover,
+                    },
                 },
-                name=args.run_name+"_"+datetime.datetime.now().strftime("%Y%m%d_%H%M"),
+                name=args.run_name+"-"+datetime.datetime.now().strftime("%b%d").upper(),
             )
             """
             wandb.watch(
@@ -835,7 +857,7 @@ def main():
                 eval_interval=eval_interval,
                 global_steps=total_steps,
                 wandb=wandb,
-                allow_mp_switch=args.allow_mp_switchover,
+                allow_amp_switch=args.allow_amp_switchover,
             )
             run_status = "training"
             trained_tokens, run_status = trainer.run()

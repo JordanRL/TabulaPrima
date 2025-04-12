@@ -63,7 +63,7 @@ class Trainer:
             eval_interval=100,
             global_steps=None,
             wandb=None,
-            allow_mp_switch=False,
+            allow_amp_switch=False,
     ):
         self.model = model
         self.train_dataloader = train_dataloader
@@ -89,6 +89,7 @@ class Trainer:
         self.optimizer_steps = 0
         self.inference_steps = 0
         self.steps_since_instrument = 0
+        self.steps_since_eval = 0
         self.checkpoint_interval = 60 * 60 * 4
         self.total_tokens = 0
         self.target_tokens = self.total_parameters * 10
@@ -104,7 +105,7 @@ class Trainer:
         self.use_cache = False
         self.stability_steps = 0
         self.stability_reached = False
-        self.allow_mp_switch = allow_mp_switch
+        self.allow_amp_switch = allow_amp_switch
 
     def run(self):
         self.model.train()
@@ -115,7 +116,7 @@ class Trainer:
         # Tracking training dynamics
         start_time = time.time()
         last_checkpoint_time = start_time
-        progress_bar = tqdm(total=self.target_tokens, desc=f"Pretrain [{self.run_phase.title()}] ({self._precision_mode()})", unit="tokens", colour="#4B6BFF")
+        progress_bar = tqdm(total=self.target_tokens, desc=f"Pretrain [{self.run_phase.title()}] ({self._precision_mode()})", unit="tok", colour="#4B6BFF")
         eval_interval_steps = max(1, self.eval_interval)
 
         while self.total_tokens < self.target_tokens:
@@ -137,8 +138,7 @@ class Trainer:
                 loss = self._bidirectional()
 
                 if loss.item() > 100:
-                    print(Colors.warning(
-                        f"\n Extremely high loss detected: {loss.item():.2f}. Check model initialization."))
+                    print(Colors.warning(f"\n Extremely high loss detected: {loss.item():.2f}. Check model initialization."))
                     progress_bar.close()
                     return self.total_tokens, "failed"
 
@@ -162,14 +162,15 @@ class Trainer:
                 if self.inference_steps % self.gradient_accumulation_steps == 0:
                     self.optimizer_steps += 1
                     self.steps_since_instrument += 1
+                    self.steps_since_eval += 1
 
                     self._backprop(grad_clip_value=grad_clip_value)
                     if self.run_phase == "warmup" and self.stability_reached == True:
                         self.run_phase = "core learning"
-                        mode = self._precision_mode() if self.allow_mp_switch else "FP32"
+                        mode = self._precision_mode() if self.allow_amp_switch else "FP32"
                         progress_bar.desc = f"Pretrain [{self.run_phase.title()}] ({mode})"
 
-                        if self.allow_mp_switch and self.use_amp == False:
+                        if self.allow_amp_switch and self.use_amp == False:
                             self.use_amp = True
                             if self._precision_mode() == "FP16":
                                 self.scaler = torch.amp.GradScaler()
@@ -190,7 +191,7 @@ class Trainer:
                 progress_bar.set_postfix({
                     "loss": f"{self.current_loss:.4f}",
                     "ppl": f"{self.current_perplexity:.2f}",
-                    "grad_norm": f"{self.pre_clip_grad_norm:.4f}",
+                    "grad": f"{self.pre_clip_grad_norm:.4f}",
                 })
 
                 if (self.steps_since_instrument == self.log_interval or self.optimizer_steps % eval_interval_steps == 0) and self.steps_since_instrument > 0 and self.optimizer_steps > 0:
@@ -204,21 +205,21 @@ class Trainer:
                         "metric/progress": self.optimizer_steps / self.global_steps
                     }
 
-                if self.optimizer_steps % eval_interval_steps == 0 and self.optimizer_steps > 0:
-                    print(Colors.header(f"\n{'-' * 40}"))
-                    print(Colors.header(f" Evaluating model performance on test dataset"))
-                    print(Colors.header(f"{'-' * 40}"))
+                if self.steps_since_eval > 0 and self.optimizer_steps % eval_interval_steps == 0 and self.optimizer_steps > 0:
+                    mode = self._precision_mode() if self.allow_amp_switch and self.stability_reached else "FP32"
+                    progress_bar.desc = f"Eval [Dataset] ({mode})"
 
                     # Run evaluation
                     eval_results = self.evaluate()
+                    self.steps_since_eval = 0
                     test_loss = eval_results['loss']
                     test_accuracy = eval_results['accuracy']
                     test_perplexity = eval_results['perplexity']
 
                     # Print intermediate results
-                    print(Colors.info(f"  • Eval loss: {Colors.highlight(f'{test_loss:.4f}')}"))
-                    print(Colors.info(f"  • Eval perplexity: {Colors.highlight(f'{test_perplexity:.2f}')}"))
-                    print(Colors.info(f"  • Eval accuracy: {Colors.highlight(f'{test_accuracy:.2%}')}"))
+                    #print(Colors.info(f"  • Eval loss: {Colors.highlight(f'{test_loss:.4f}')}"))
+                    #print(Colors.info(f"  • Eval perplexity: {Colors.highlight(f'{test_perplexity:.2f}')}"))
+                    #print(Colors.info(f"  • Eval accuracy: {Colors.highlight(f'{test_accuracy:.2%}')}"))
 
                     eval_dict = {
                         "eval/test_loss": test_loss,
@@ -227,6 +228,7 @@ class Trainer:
                         "metric/progress": self.optimizer_steps / self.global_steps,
                     }
                     self.model.train()
+                    progress_bar.desc = f"Pretrain [{self.run_phase.title()}] ({mode})"
 
                 log_dict = {}
                 if training_dict is not None:

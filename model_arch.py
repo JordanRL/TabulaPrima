@@ -326,14 +326,25 @@ class FeedForward(nn.Module):
 
 # Transformer Layer with MLA
 class TransformerLayer(nn.Module):
-    def __init__(self, hidden_dim, num_heads, ff_dim, latent_dim, dropout, max_seq_len, use_checkpointing=False):
+    def __init__(
+            self,
+            hidden_dim,
+            num_heads,
+            ff_dim,
+            kv_latent_dim,
+            q_latent_dim,
+            dropout,
+            max_seq_len,
+            rope_head_dim,
+            use_checkpointing=False
+    ):
         super().__init__()
         self.attention = MultiHeadLatentAttention(
             hidden_dim=hidden_dim,
             num_heads=num_heads,
-            kv_latent_dim=latent_dim,
-            q_latent_dim=latent_dim,
-            rope_head_dim=(hidden_dim // num_heads) // 4,
+            kv_latent_dim=kv_latent_dim,
+            q_latent_dim=q_latent_dim,
+            rope_head_dim=rope_head_dim,
             dropout=dropout,
             max_seq_len=max_seq_len,
         )
@@ -403,9 +414,11 @@ class MLATransformer(nn.Module):
             num_layers,
             num_heads,
             ff_dim,
-            latent_dim,
+            kv_latent_dim,
+            q_latent_dim,
             dropout,
             max_seq_len,
+            rope_head_dim,
             use_checkpointing=False
     ):
         super().__init__()
@@ -417,12 +430,14 @@ class MLATransformer(nn.Module):
         # Use torch.nn.ModuleList for better memory efficiency with checkpoint
         self.layers = nn.ModuleList([
             TransformerLayer(
-                hidden_dim,
-                num_heads,
-                ff_dim,
-                latent_dim,
-                dropout,
-                max_seq_len,
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                kv_latent_dim=kv_latent_dim,
+                q_latent_dim=q_latent_dim,
+                dropout=dropout,
+                max_seq_len=max_seq_len,
+                rope_head_dim=rope_head_dim,
                 use_checkpointing=use_checkpointing
             )
             for _ in range(num_layers)
