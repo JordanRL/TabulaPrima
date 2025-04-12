@@ -337,14 +337,10 @@ class Trainer:
         }
 
     def _loss_calc(self, logits, labels):
-        # Shift logits and labels for next token prediction
-        shifted_logits = logits[:, :-1, :].contiguous()
-        shifted_labels = labels[:, 1:].contiguous()  # Assuming labels are passed correctly
-
         # Flatten the tensors
-        vocab_size = shifted_logits.size(-1)
-        flat_logits = shifted_logits.view(-1, vocab_size)
-        flat_labels = shifted_labels.view(-1)
+        vocab_size = logits.size(-1)
+        flat_logits = logits.view(-1, vocab_size)
+        flat_labels = labels.view(-1)
 
         # Calculate loss using ignore_index on shifted tensors
         loss = F.cross_entropy(
