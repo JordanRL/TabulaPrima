@@ -169,7 +169,7 @@ class Trainer:
                         mode = self._precision_mode() if self.allow_mp_switch else "FP32"
                         progress_bar.desc = f"Pretrain [{self.run_phase.title()}] ({mode})"
 
-                        if self.use_amp == False and self.allow_mp_switch:
+                        if self.allow_mp_switch and self.use_amp == False:
                             self.use_amp = True
                             if self._precision_mode() == "FP16":
                                 self.scaler = torch.amp.GradScaler()
