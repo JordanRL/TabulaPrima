@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import sys
 import datetime
@@ -56,7 +57,9 @@ class Colors:
     def highlight(text):
         return f"{Colors.CYAN}{Colors.BOLD}{text}{Colors.ENDC}"
 
-# Model defaults
+# Default model definition params
+# These will be overwritten after parsing arguments and loading the model def
+model_def = {}
 HIDDEN_DIM = 1152
 NUM_LAYERS = 12
 NUM_HEADS = 9
@@ -71,46 +74,40 @@ Q_LATENT_DIM = MLA_LATENT_DIM
 
 # Training defaults
 DROPOUT = 0.1
-VOCAB_SIZE = 50257  # GPT-2 tokenizer vocab size
 BATCH_SIZE = 1
 GRAD_STEPS = 8
 LEARNING_RATE = 5e-5
+TOK_PER_PARAM = 10
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train an MLA Transformer with cached datasets")
 
+    # Run arguments
+    parser.add_argument("--run-name", type=str, default="WikiText", help="The base name of the run in W&B")
+
     # Dataset arguments
     parser.add_argument("--dataset", type=str, default="wikitext", help="Dataset path (e.g., wikitext)")
     parser.add_argument("--dataset-name", type=str, default="wikitext-103-raw-v1", help="Dataset name")
-    parser.add_argument("--run-name", type=str, default="WikiText", help="The base name of the run in W&B")
+    parser.add_argument("--dataset-type", type=str, default="hf", help="The dataset type (e.g. hf)")
     parser.add_argument("--cache-dir", type=str, default="dataset_cache", help="Directory to store cached datasets")
     parser.add_argument("--no-cache", action="store_true", help="Disable dataset caching")
     parser.add_argument("--clear-cache", action="store_true", help="Clear existing cache before training")
 
-    # Model arguments
+    # Model definition and arguments
+    parser.add_argument("--model-def", type=str, default="255m_params.json", help="Model definition file name in configs/model_defs/ directory")
     parser.add_argument("--seq-length", type=int, default=MAX_SEQ_LENGTH, help="Maximum sequence length")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size per GPU")
-    parser.add_argument("--grad-acc-steps", type=int, default=GRAD_STEPS, help="Gradient accumulation steps")
-    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="Learning rate")
 
     # Training arguments
+    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="Learning rate")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size per GPU")
+    parser.add_argument("--grad-acc-steps", type=int, default=GRAD_STEPS, help="Gradient accumulation steps")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--model-dir", type=str, default="models", help="Directory to save final model")
     parser.add_argument("--use-checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
     parser.add_argument("--allow-amp-switchover", action="store_true", help="Allows the training run to switch over to mixed precision once it reaches stability")
 
     return parser.parse_args()
-
-# Define RoPE dimension per head (d_h^R in paper)
-# Let's use the user's original rope_dim calculation for this example
-
-
-# Define compressed content head dimension (d_h^C)
- # e.g., 128 - 32 = 96
-
-# Define latent dimensions (d_c for KV, d'_c for Q in paper)
-# Let's assume they are the same for simplicity, using user's MLA_LATENT_DIM
 
 
 # Training Dataset
@@ -407,6 +404,32 @@ def check_grad_enabled(model):
 # Main training script with improvements for 2070 Super
 def main():
     args = parse_args()
+    
+    # Load model definition from JSON file
+    global model_def, HIDDEN_DIM, NUM_LAYERS, NUM_HEADS, HEAD_DIM, FF_DIM, MLA_LATENT_DIM
+    global MAX_SEQ_LENGTH, ROPE_HEAD_DIM, COMPRESSED_HEAD_DIM, KV_LATENT_DIM, Q_LATENT_DIM
+    
+    model_def_path = os.path.join('configs', 'model_defs', args.model_def)
+    try:
+        with open(model_def_path, 'r') as f:
+            model_def = json.load(f)
+        print(Colors.success(f"✓ Successfully loaded model definition from {args.model_def}"))
+        
+        # Update model parameters from the loaded definition
+        HIDDEN_DIM = model_def.get('HIDDEN_DIM', HIDDEN_DIM)
+        NUM_LAYERS = model_def.get('NUM_LAYERS', NUM_LAYERS)
+        NUM_HEADS = model_def.get('NUM_HEADS', NUM_HEADS)
+        HEAD_DIM = model_def.get('HEAD_DIM', HIDDEN_DIM // NUM_HEADS)
+        FF_DIM = model_def.get('FF_DIM', FF_DIM)
+        MLA_LATENT_DIM = model_def.get('MLA_LATENT_DIM', MLA_LATENT_DIM)
+        MAX_SEQ_LENGTH = model_def.get('MAX_SEQ_LENGTH', MAX_SEQ_LENGTH)
+        ROPE_HEAD_DIM = model_def.get('ROPE_HEAD_DIM', ROPE_HEAD_DIM)
+        COMPRESSED_HEAD_DIM = model_def.get('COMPRESSED_HEAD_DIM', HEAD_DIM - ROPE_HEAD_DIM)
+        KV_LATENT_DIM = model_def.get('KV_LATENT_DIM', MLA_LATENT_DIM)
+        Q_LATENT_DIM = model_def.get('Q_LATENT_DIM', MLA_LATENT_DIM)
+    except Exception as e:
+        print(Colors.error(f"❌ Failed to load model definition from {model_def_path}: {e}"))
+        print(Colors.warning(f"Using default model parameters instead"))
 
     def display_frame_info(frame_info: FrameSummary):
         print(Colors.info(f"  File: {Colors.highlight(frame_info.filename)}"))
@@ -640,10 +663,15 @@ def main():
             param_size_mb = total_params * 4 / (1024 ** 2)
 
             print(Colors.info(f"  • Architecture: Multi-head Latent Attention Transformer"))
+            print(Colors.info(f"  • Model definition: {Colors.highlight(args.model_def)}"))
             print(Colors.info(f"  • Hidden dimension: {Colors.highlight(str(HIDDEN_DIM))}"))
             print(Colors.info(f"  • Attention heads: {Colors.highlight(str(NUM_HEADS))}"))
             print(Colors.info(f"  • Layers: {Colors.highlight(str(NUM_LAYERS))}"))
+            print(Colors.info(f"  • Head dimension: {Colors.highlight(str(HEAD_DIM))}"))
+            print(Colors.info(f"  • RoPE head dimension: {Colors.highlight(str(ROPE_HEAD_DIM))}"))
+            print(Colors.info(f"  • Compressed head dimension: {Colors.highlight(str(COMPRESSED_HEAD_DIM))}"))
             print(Colors.info(f"  • Latent dimension: {Colors.highlight(str(MLA_LATENT_DIM))}"))
+            print(Colors.info(f"  • Feed-forward dimension: {Colors.highlight(str(FF_DIM))}"))
             print(Colors.info(f"  • Parameters: {Colors.highlight(f'{total_params:,}')}"))
             print(Colors.info(f"  • Model size: {Colors.highlight(f'{param_size_mb:.2f} MB')}"))
 
@@ -684,7 +712,7 @@ def main():
 
     if run_status == "setup":
         # Learning rate scheduler
-        target_tokens = total_params * 10
+        target_tokens = total_params * TOK_PER_PARAM
         total_steps = target_tokens // (train_dataset.total_tokens / (len(train_dataloader) // args.grad_acc_steps))
         eval_interval = 100
 
@@ -810,6 +838,10 @@ def main():
                         "ff_dim": FF_DIM,
                         "latent_dim": MLA_LATENT_DIM,
                         "rope_head_dim": ROPE_HEAD_DIM,
+                        "compressed_head_dim": COMPRESSED_HEAD_DIM,
+                        "kv_latent_dim": KV_LATENT_DIM,
+                        "q_latent_dim": Q_LATENT_DIM,
+                        "source": "255m_params.json" if model_def else "default values"
                     },
                     "training_def": {
                         "batch_size": args.batch_size,

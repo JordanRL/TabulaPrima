@@ -212,6 +212,7 @@ class Trainer:
                 if self.steps_since_eval > 0 and self.optimizer_steps % eval_interval_steps == 0 and self.optimizer_steps > 0:
                     mode = self._precision_mode() if self.allow_amp_switch and self.stability_reached else "FP32"
                     progress_bar.desc = f"Eval [Dataset] ({mode})"
+                    progress_bar.update(0)
 
                     # Run evaluation
                     eval_results = self.evaluate()
@@ -223,11 +224,6 @@ class Trainer:
                     self.test_accuracy_history.append(test_accuracy)
                     self.test_loss_history.append(test_loss)
 
-                    # Print intermediate results
-                    #print(Colors.info(f"  • Eval loss: {Colors.highlight(f'{test_loss:.4f}')}"))
-                    #print(Colors.info(f"  • Eval perplexity: {Colors.highlight(f'{test_perplexity:.2f}')}"))
-                    #print(Colors.info(f"  • Eval accuracy: {Colors.highlight(f'{test_accuracy:.2%}')}"))
-
                     eval_dict = {
                         "eval/test_loss": test_loss,
                         "eval/test_perplexity": test_perplexity,
@@ -236,6 +232,7 @@ class Trainer:
                     }
                     self.model.train()
                     progress_bar.desc = f"Pretrain [{self.run_phase.title()}] ({mode})"
+                    progress_bar.update(0)
 
                 log_dict = {}
                 if training_dict is not None:
