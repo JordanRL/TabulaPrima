@@ -819,6 +819,7 @@ def main():
                         "dropout": DROPOUT,
                         "grad_checkpoints": args.use_checkpointing,
                         "allow_amp_switch": args.allow_amp_switchover,
+                        "target_tokens": target_tokens,
                     },
                 },
                 name=args.run_name+"-"+datetime.datetime.now().strftime("%b%d").upper(),
