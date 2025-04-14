@@ -812,7 +812,7 @@ def main():
         # Learning rate scheduler
         target_tokens = total_params * TOK_PER_PARAM
         total_steps = target_tokens // (train_dataset.effective_total_tokens / (len(train_dataloader) // args.grad_acc_steps))
-        eval_interval = 1000
+        eval_interval = 100
 
         # Print training configuration
         training_console.print(Colors.info(f"  • Dataset: {Colors.highlight(f'{args.dataset}/{args.dataset_name}')}"))
