@@ -1,6 +1,6 @@
 .idea
-checkpoints
-models
+checkpoints/*
+models/*
 TabulaPrima.egg-info
 wandb
 dataset_cache
