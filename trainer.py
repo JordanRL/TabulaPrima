@@ -255,7 +255,7 @@ class Trainer:
                     self.pre_clip_grad_norm = self.pre_clip_grad_norm ** 0.5
 
                     if self.allow_amp_switch:
-                        self._precision_phase()
+                        self._precision_phase(start_time)
 
                     # Update weights after accumulating gradients
                     if self.training_state.inference_steps % self.gradient_accumulation_steps == 0:
@@ -524,7 +524,7 @@ class Trainer:
 
         return logits, loss
 
-    def _precision_phase(self):
+    def _precision_phase(self, start_time):
         if self.training_state.stability_reached:
             return None
         if self.pre_clip_grad_norm < 1.0:
@@ -534,7 +534,23 @@ class Trainer:
 
         if self.training_state.stability_steps >= self.gradient_accumulation_steps and self.training_state.stability_reached == False:
             self.training_state.stability_reached = True
-            self.console.print(Colors.success(f"🎉 Stability Reached! Continuing in {self._precision_mode()} mode. 🎉"))
+            # Calculate training time estimate
+            elapsed_time = time.time() - start_time
+
+            # Format time estimate nicely
+            if elapsed_time > 60:
+                str_time = f"{elapsed_time % 60:.2f}s"
+                elapsed_time = elapsed_time / 60
+                str_time = f"{int(elapsed_time % 60)}m " + str_time
+            else:
+                str_time = f"{elapsed_time:.2f}s"
+            if elapsed_time > 60:
+                str_time = f"{int(elapsed_time / 60)}h " + str_time
+                elapsed_time = elapsed_time / 24
+            if elapsed_time > 1:
+                str_time = f"{int(elapsed_time)}d " + str_time
+
+            self.console.print(Colors.success(f"🎉 Stability Reached in {self.total_tokens:,} tokens ({str_time})! Continuing in {self._precision_mode()} mode. 🎉"))
 
     def _update_metrics(self, loss, actual_tokens_in_batch):
         self.training_state.update_metrics(
