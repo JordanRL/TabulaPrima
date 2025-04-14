@@ -7,6 +7,7 @@ import pickle
 import hashlib
 import traceback
 from traceback import FrameSummary
+from typing import Optional, Dict, Any, List
 
 import tiktoken
 import torch
@@ -15,6 +16,7 @@ import torch.nn.functional as F
 from rich.align import Align
 from rich.panel import Panel
 from rich.table import Column
+from torch.optim import Optimizer
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup, PreTrainedTokenizerFast
 import os
@@ -140,11 +142,12 @@ KV_LATENT_DIM = MLA_LATENT_DIM
 Q_LATENT_DIM = MLA_LATENT_DIM
 
 # Training defaults
-DROPOUT = 0.1
+DROPOUT = 0.0
 BATCH_SIZE = 1
 GRAD_STEPS = 8
 LEARNING_RATE = 5e-5
 TOK_PER_PARAM = 10
+WEIGHT_DECAY = 0.01
 
 
 def parse_args():
@@ -157,6 +160,7 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="wikitext", help="Dataset path (e.g., wikitext)")
     parser.add_argument("--dataset-name", type=str, default="wikitext-103-raw-v1", help="Dataset name")
     parser.add_argument("--dataset-type", type=str, default="hf", help="The dataset type (e.g. hf)")
+    parser.add_argument("--stream-dataset", action="store_true", help="Makes the training application using the HuggingFace streaming dataset loader")
     parser.add_argument("--cache-dir", type=str, default="dataset_cache", help="Directory to store cached datasets")
     parser.add_argument("--no-cache", action="store_true", help="Disable dataset caching")
     parser.add_argument("--clear-cache", action="store_true", help="Clear existing cache before training")
@@ -166,6 +170,7 @@ def parse_args():
     parser.add_argument("--seq-length", type=int, default=MAX_SEQ_LENGTH, help="Maximum sequence length")
 
     # Training arguments
+    parser.add_argument("--train-def", type=str, default="255m_params_2070.json", help="Training definition file name in configs/train_defs/ directory")
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size per GPU")
     parser.add_argument("--grad-acc-steps", type=int, default=GRAD_STEPS, help="Gradient accumulation steps")
@@ -491,6 +496,157 @@ class CachedHFDataset(Dataset):
             "labels": input_ids[1:]
         }
 
+class TokenBasedCosineLRScheduler:
+    """
+    A learning rate scheduler that implements linear warmup followed by cosine decay,
+    based on the cumulative number of tokens processed.
+
+    This scheduler is self-contained and does not rely on global or nonlocal
+    variables for tracking state.
+    """
+
+    def __init__(self,
+                 optimizer: Optimizer,
+                 target_total_tokens: int,
+                 max_lr: float,
+                 min_lr: Optional[float] = None,
+                 warmup_tokens: Optional[int] = None,
+                 warmup_ratio: Optional[float] = None):
+        """
+        Initializes the TokenBasedCosineLRScheduler.
+
+        Args:
+            optimizer (Optimizer): The optimizer instance to schedule.
+            target_total_tokens (int): The total number of tokens planned for training.
+                                       Cosine decay completes at this point.
+            max_lr (float): The target maximum learning rate (peak LR) reached
+                            after warmup.
+            min_lr (Optional[float]): The minimum learning rate to decay to.
+                                      If None, defaults to 0.0, meaning the LR will
+                                      decay to zero at target_total_tokens.
+                                      Warmup always starts from 0, regardless of min_lr.
+            warmup_tokens (Optional[int]): The number of tokens for the linear warmup phase.
+                                           Mutually exclusive with warmup_ratio.
+            warmup_ratio (Optional[float]): The fraction of target_total_tokens for the
+                                            linear warmup phase. Mutually exclusive with
+                                            warmup_tokens. Must be between 0.0 and 1.0.
+
+        Raises:
+            ValueError: If configuration is invalid (e.g., missing args,
+                        conflicting args, invalid values).
+        """
+        if not isinstance(optimizer, Optimizer):
+            raise TypeError(f"{type(optimizer).__name__} is not an Optimizer")
+        if not isinstance(target_total_tokens, int) or target_total_tokens <= 0:
+            raise ValueError("target_total_tokens must be a positive integer.")
+        if not isinstance(max_lr, (float, int)) or max_lr <= 0:
+            raise ValueError("max_lr must be a positive number.")
+        if min_lr is not None and (not isinstance(min_lr, (float, int)) or min_lr < 0):
+            raise ValueError("min_lr must be a non-negative number.")
+        if min_lr is not None and min_lr >= max_lr:
+            raise ValueError("min_lr must be less than max_lr.")
+
+        if (warmup_tokens is None and warmup_ratio is None) or \
+           (warmup_tokens is not None and warmup_ratio is not None):
+            raise ValueError("Exactly one of warmup_tokens or warmup_ratio must be specified.")
+
+        if warmup_ratio is not None:
+            if not isinstance(warmup_ratio, float) or not (0.0 <= warmup_ratio <= 1.0):
+                raise ValueError("warmup_ratio must be a float between 0.0 and 1.0.")
+            self._warmup_tokens = int(warmup_ratio * target_total_tokens)
+        else:
+            if not isinstance(warmup_tokens, int) or warmup_tokens < 0:
+                raise ValueError("warmup_tokens must be a non-negative integer.")
+            if warmup_tokens > target_total_tokens:
+                 raise ValueError("warmup_tokens cannot be greater than target_total_tokens.")
+            self._warmup_tokens = warmup_tokens
+
+        self.optimizer = optimizer
+        self.target_total_tokens = target_total_tokens
+        self.max_lr = float(max_lr)
+        # If min_lr is not provided, decay targets zero.
+        self.min_lr = float(min_lr) if min_lr is not None else 0.0
+        self._current_tokens = 0 # Internal state: tracks tokens processed
+
+        # Calculate the ratio for min_lr relative to max_lr for cosine decay scaling
+        self._min_lr_ratio = self.min_lr / self.max_lr
+
+        # Set initial LR - Warmup starts from 0, so initial LR should be effectively 0
+        self._set_lr(0.0)
+
+    def _get_lr_multiplier(self, current_tokens: int) -> float:
+        """Calculates the LR multiplier based on the current token count."""
+        # Ensure non-negative tokens
+        current_tokens = max(0, current_tokens)
+
+        # --- Warmup Phase ---
+        if current_tokens < self._warmup_tokens:
+            if self._warmup_tokens == 0: # Handle zero warmup edge case
+                 return 1.0 # Instantly at max LR if no warmup
+            warmup_fraction = float(current_tokens) / float(self._warmup_tokens)
+            # Linear warmup from 0 to 1.0 multiplier
+            return warmup_fraction
+
+        # --- Decay Phase ---
+        else:
+            tokens_after_warmup = current_tokens - self._warmup_tokens
+            decay_duration_tokens = self.target_total_tokens - self._warmup_tokens
+
+            # Handle edge case: if training ends exactly at warmup
+            if decay_duration_tokens <= 0:
+                return 1.0 # Stay at max_lr multiplier
+
+            # Calculate progress within the decay phase (clamp between 0 and 1)
+            decay_progress = min(1.0, float(tokens_after_warmup) / float(decay_duration_tokens))
+
+            # Calculate cosine decay (goes from 1 down to 0)
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+
+            # Interpolate between max_lr (multiplier 1.0) and min_lr (multiplier _min_lr_ratio)
+            multiplier = self._min_lr_ratio + (1.0 - self._min_lr_ratio) * cosine_decay
+            return multiplier
+
+    def _set_lr(self, multiplier: float):
+        """Sets the learning rate in the optimizer based on the multiplier and max_lr."""
+        # Calculate the actual learning rate
+        lr = self.max_lr * multiplier
+        # Ensure LR doesn't go below the specified minimum during float operations
+        lr = max(self.min_lr, lr)
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+
+    def step(self, tokens_processed_so_far: int):
+        """
+        Updates the scheduler's state and the optimizer's learning rate based
+        on the total number of tokens processed so far.
+
+        Args:
+            tokens_processed_so_far (int): The cumulative number of tokens
+                                           processed since training started.
+        """
+        if not isinstance(tokens_processed_so_far, int) or tokens_processed_so_far < 0:
+            raise ValueError("tokens_processed_so_far must be a non-negative integer.")
+
+        self._current_tokens = tokens_processed_so_far
+        multiplier = self._get_lr_multiplier(self._current_tokens)
+        self._set_lr(multiplier)
+
+    def get_last_lr(self) -> list[float]:
+         """ Returns the last computed learning rate(s) for the optimizer's param groups. """
+         # Since we set all param groups to the same LR in _set_lr:
+         if not self.optimizer.param_groups:
+             return []
+         return [self.optimizer.param_groups[0]['lr']] # Return list for consistency
+
+    def __repr__(self) -> str:
+        return (f"{self.__class__.__name__}("
+                f"target_total_tokens={self.target_total_tokens}, "
+                f"max_lr={self.max_lr}, "
+                f"min_lr={self.min_lr}, "
+                f"warmup_tokens={self._warmup_tokens}, "
+                f"current_tokens={self._current_tokens})")
+
 # Main training script with improvements for 2070 Super
 def main():
     training_console = Console(soft_wrap=True)
@@ -514,8 +670,10 @@ def main():
     # Load model definition from JSON file
     global model_def, HIDDEN_DIM, NUM_LAYERS, NUM_HEADS, HEAD_DIM, FF_DIM, MLA_LATENT_DIM
     global MAX_SEQ_LENGTH, ROPE_HEAD_DIM, COMPRESSED_HEAD_DIM, KV_LATENT_DIM, Q_LATENT_DIM
+    global DROPOUT, BATCH_SIZE, GRAD_STEPS, LEARNING_RATE, TOK_PER_PARAM, WEIGHT_DECAY
     
     model_def_path = os.path.join('configs', 'model_defs', args.model_def)
+    train_def_path = os.path.join('configs', 'training_defs', args.train_def)
     try:
         with open(model_def_path, 'r') as f:
             model_def = json.load(f)
@@ -533,8 +691,25 @@ def main():
         COMPRESSED_HEAD_DIM = model_def.get('COMPRESSED_HEAD_DIM', HEAD_DIM - ROPE_HEAD_DIM)
         KV_LATENT_DIM = model_def.get('KV_LATENT_DIM', MLA_LATENT_DIM)
         Q_LATENT_DIM = model_def.get('Q_LATENT_DIM', MLA_LATENT_DIM)
+
     except Exception as e:
         training_console.print(Colors.error(f"❌ Failed to load model definition from {model_def_path}: {e}"))
+        training_console.print(Colors.warning(f"Using default model parameters instead"))
+
+    try:
+        with open(train_def_path, 'r') as f:
+            train_def = json.load(f)
+        training_console.print(Colors.success(f"✓ Successfully loaded training definition from {args.train_def}"))
+
+        # Update training parameters
+        DROPOUT = train_def.get('DROPOUT', DROPOUT)
+        BATCH_SIZE = train_def.get('BATCH_SIZE', BATCH_SIZE)
+        GRAD_STEPS = train_def.get('GRAD_STEPS', GRAD_STEPS)
+        LEARNING_RATE = train_def.get('LEARNING_RATE', LEARNING_RATE)
+        TOK_PER_PARAM = train_def.get('TOK_PER_PARAM', TOK_PER_PARAM)
+        WEIGHT_DECAY = train_def.get('WEIGHT_DECAY', WEIGHT_DECAY)
+    except Exception as e:
+        training_console.print(Colors.error(f"❌ Failed to load training definition from {train_def_path}: {e}"))
         training_console.print(Colors.warning(f"Using default model parameters instead"))
 
     def display_frame_info(frame_info: FrameSummary):
@@ -586,6 +761,7 @@ def main():
         print("Falling back to GPT-2 tokenizer")
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.vocab_size = 50257
 
     # Initialize variables
     trained_tokens = None
@@ -608,6 +784,25 @@ def main():
                 seq_length=args.seq_length,
                 split="test"
             )
+        elif args.stream_dataset:
+            def tokenize_example(batch: Dict[str, list]) -> Dict[str, list]:
+                encoded_texts = tokenizer.encode_batch(batch["text"])
+                return {
+                    "input_ids": encoded_texts
+                }
+            core_dataset = load_dataset(
+                path=args.dataset,
+                name=args.dataset_name,
+                split="train",
+                streaming=True,
+                trust_remote_code=True,
+                cache_dir=args.cache_dir
+            )
+            core_dataset = core_dataset.map(tokenize_example, batched=True)
+            core_dataset = core_dataset.shuffle(seed=1240, buffer_size=10000)
+
+            test_dataset = core_dataset.take(1000)
+            train_dataset = core_dataset.skip(1000)
         else:
             # Use the cached dataset implementation
             train_dataset = CachedHFDataset(
@@ -685,24 +880,115 @@ def main():
             "labels": torch.stack(labels_padded)
         }
 
+    def collate_fn_stream(collate_batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """
+        Collate function for language modeling with EXPLICIT label shifting.
+        - Takes batch where each item has 'input_ids'.
+        - Creates inputs by taking all but the last token.
+        - Creates labels by taking all but the first token.
+        - Pads inputs and labels to the same max length (derived from original length - 1).
+        """
+        proc_batch = []
+        max_len_after_shift = 0
+        for item in collate_batch:
+            # Ensure input_ids are lists or easily sliceable
+            ids = item["input_ids"]
+            if isinstance(ids, torch.Tensor):
+                ids = ids.tolist() # Easier slicing for now
+
+            if len(ids) < 2: # Need at least 2 tokens to create a pair
+                continue
+
+            if len(ids) > MAX_SEQ_LENGTH:
+                ids = ids[:MAX_SEQ_LENGTH]
+
+            input_seq = ids[:-1]
+            label_seq = ids[1:]
+            max_len_after_shift = max(max_len_after_shift, len(input_seq))
+            proc_batch.append({
+                "inputs": torch.tensor(input_seq, dtype=torch.long),
+                "labels": torch.tensor(label_seq, dtype=torch.long)
+                })
+
+        if not proc_batch: # Handle empty batch after filtering
+            return {}
+
+        # Sort by the new length (which is max_len_after_shift for the longest)
+        # Sorting isn't strictly necessary here after finding max_len, but can be kept
+        # proc_batch.sort(key=lambda x: len(x["inputs"]), reverse=True)
+        # max_len_after_shift = len(proc_batch[0]["inputs"]) # Max length after shift
+
+        input_ids_padded = []
+        labels_padded = []
+        collate_attention_mask = []
+
+        for item in proc_batch:
+            inputs = item["inputs"]
+            labels = item["labels"]
+            current_len = len(inputs) # inputs and labels have same length here
+            padding_len = max_len_after_shift - current_len
+
+            # 1. Pad input_ids (using input padding token)
+            padded_ids = torch.cat([
+                inputs,
+                torch.full((padding_len,), tokenizer.pad_token_id, dtype=torch.long)
+            ])
+            input_ids_padded.append(padded_ids)
+
+            # 2. Create attention mask (based on padded inputs)
+            mask = torch.cat([
+                torch.ones(current_len, dtype=torch.long),
+                torch.zeros(padding_len, dtype=torch.long)
+            ])
+            collate_attention_mask.append(mask)
+
+            # 3. Pad labels (using label ignore index)
+            padded_labels = torch.cat([
+                labels,
+                torch.full((padding_len,), -100, dtype=torch.long)
+            ])
+            labels_padded.append(padded_labels)
+
+        # Stack into final batch tensors - note key name change
+        return {
+            "input_ids": torch.stack(input_ids_padded), # Note: these are inputs[:-1]
+            "attention_mask": torch.stack(collate_attention_mask),
+            "labels": torch.stack(labels_padded)       # Note: these are inputs[1:]
+        }
+
     try:
         if run_status == "setup":
             # Create data loaders
-            train_dataloader = DataLoader(
-                train_dataset,
-                batch_size=args.batch_size,
-                shuffle=True,
-                num_workers=0,  # No multiprocessing to save memory
-                collate_fn=collate_fn
-            )
+            if args.stream_dataset:
+                train_dataloader = DataLoader(
+                    train_dataset,
+                    batch_size=BATCH_SIZE,
+                    num_workers=0,
+                    collate_fn=collate_fn_stream
+                )
 
-            test_dataloader = DataLoader(
-                test_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=0,
-                collate_fn=collate_fn
-            )
+                test_dataloader = DataLoader(
+                    test_dataset,
+                    batch_size=BATCH_SIZE,
+                    num_workers=0,
+                    collate_fn=collate_fn_stream
+                )
+            else:
+                train_dataloader = DataLoader(
+                    train_dataset,
+                    batch_size=BATCH_SIZE,
+                    shuffle=True,
+                    num_workers=0,
+                    collate_fn=collate_fn
+                )
+
+                test_dataloader = DataLoader(
+                    test_dataset,
+                    batch_size=BATCH_SIZE,
+                    shuffle=False,
+                    num_workers=0,
+                    collate_fn=collate_fn
+                )
         else:
             training_console.print(Colors.warning(f"\n  🚫 Data loaders skipped due to previous error"))
             train_dataloader = None
@@ -733,7 +1019,7 @@ def main():
 
             # Create model instance
             model = MLATransformer(
-                vocab_size=train_dataset.vocab_size,
+                vocab_size=tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else 50257,
                 hidden_dim=HIDDEN_DIM,
                 num_layers=NUM_LAYERS,
                 num_heads=NUM_HEADS,
@@ -741,7 +1027,7 @@ def main():
                 kv_latent_dim=KV_LATENT_DIM,
                 q_latent_dim=Q_LATENT_DIM,
                 dropout=DROPOUT,
-                max_seq_len=args.seq_length,
+                max_seq_len=MAX_SEQ_LENGTH,
                 rope_head_dim=ROPE_HEAD_DIM,
                 use_checkpointing=args.use_checkpointing
             )
@@ -781,7 +1067,7 @@ def main():
             optimizer_grouped_parameters = [
                 {
                     "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                    "weight_decay": 0.01,
+                    "weight_decay": WEIGHT_DECAY,
                 },
                 {
                     "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
@@ -796,7 +1082,7 @@ def main():
                 #print(Colors.success(f"✓ Using 8-bit Adam optimizer for memory efficiency"))
             #except ImportError:
                 # Fall back to regular AdamW
-            optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+            optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=LEARNING_RATE, betas=(0.9, 0.95))
             training_console.print(Colors.warning(f"\n  ⚠️ Using regular AdamW optimizer (8-bit not available)"))
         else:
             training_console.print(Colors.warning(f"\n  🚫 Optimizer configuration skipped due to previous error"))
@@ -811,20 +1097,17 @@ def main():
     if run_status == "setup":
         # Learning rate scheduler
         target_tokens = total_params * TOK_PER_PARAM
-        total_steps = target_tokens // (train_dataset.effective_total_tokens / (len(train_dataloader) // args.grad_acc_steps))
         eval_interval = 100
 
         # Print training configuration
         training_console.print(Colors.info(f"  • Dataset: {Colors.highlight(f'{args.dataset}/{args.dataset_name}')}"))
-        training_console.print(Colors.info(f"  • Sequence Length: {Colors.highlight(str(args.seq_length))}"))
-        training_console.print(Colors.info(f"  • Batch Size: {Colors.highlight(str(args.batch_size))} " +
-                                           f"(effective: {Colors.highlight(str(args.batch_size * args.grad_acc_steps))})"))
-        training_console.print(Colors.info(f"  • Learning Rate: {Colors.highlight(str(args.learning_rate))}"))
+        training_console.print(Colors.info(f"  • Sequence Length: {Colors.highlight(str(MAX_SEQ_LENGTH))}"))
+        training_console.print(Colors.info(f"  • Batch Size: {Colors.highlight(str(BATCH_SIZE))} " +
+                                           f"(effective: {Colors.highlight(str(BATCH_SIZE * GRAD_STEPS))})"))
+        training_console.print(Colors.info(f"  • Learning Rate: {Colors.highlight(str(LEARNING_RATE))}"))
         training_console.print(Colors.info(f"  • Using Cache: {Colors.highlight('No' if args.no_cache else 'Yes')}"))
-        training_console.print(Colors.info(f"  • Gradient accumulation steps: {Colors.highlight(str(args.grad_acc_steps))}"))
-        training_console.print(Colors.info(f"  • Estimated total optimizer steps: {Colors.highlight(f'{total_steps:,}')}"))
+        training_console.print(Colors.info(f"  • Gradient accumulation steps: {Colors.highlight(str(GRAD_STEPS))}"))
         training_console.print(Colors.info(f"  • Target training tokens: {Colors.highlight(f'{target_tokens:,}')}"))
-        training_console.print(Colors.info(f"  • Estimated average tokens per optimizer step: {Colors.highlight(f'{(target_tokens/total_steps):.2f}')}"))
 
         # Measure the actual tokens per second using a warm-up phase
         training_console.rule(Colors.highlight("Performance Estimation"), style=Colors.HEADER)
@@ -836,88 +1119,12 @@ def main():
 
     try:
         if run_status == "setup":
-            # Do a few warm-up steps to measure performance
-            model.train()
-
-            # Create small dataloader with a few batches for measurement
-            measure_batch_size = args.batch_size
-            measure_dataset = torch.utils.data.Subset(train_dataset, list(range(min(20, len(train_dataset)))))
-            measure_dataloader = DataLoader(
-                measure_dataset,
-                batch_size=measure_batch_size,
-                shuffle=True,
-                collate_fn=collate_fn
-            )
-
-            measure_target = 500000
-
-            measure_progress = Progress(console=training_console, transient=True, expand=True)
-            measure_task = measure_progress.add_task(description="Measuring", total=measure_target)
-
-            # Run a few iterations and measure speed
-            start_time = time.time()
-            total_tokens_processed = 0
-            measure_progress.start()
-
-            with torch.no_grad():  # No need for gradients during measurement
-                for batch in measure_dataloader:
-                    input_ids = batch['input_ids'].to(device)
-                    attention_mask = batch['attention_mask'].to(device)
-
-                    # Count non-padding tokens
-                    actual_tokens = attention_mask.sum().item()
-                    total_tokens_processed += actual_tokens
-                    measure_progress.update(measure_task, advance=actual_tokens)
-
-                    # Forward pass only (no backprop needed for measurement)
-                    _ = model(input_ids, attention_mask=attention_mask)
-
-                    # Break after processing a few batches
-                    if total_tokens_processed > measure_target:  # Enough for a good measurement
-                        break
-
-            measure_progress.stop()
-            measurement_time = time.time() - start_time
-            measured_tokens_per_second = total_tokens_processed / measurement_time
-
-            # Apply a conservative factor to account for backpropagation and later epoch slowdown
-            estimated_tokens_per_second = measured_tokens_per_second * 0.55  # 55% of measured forward-only speed
-
-            training_console.print(Colors.success(f"  • Measured forward pass speed: {Colors.highlight(f'{measured_tokens_per_second:.1f}')} tokens/sec"))
-            training_console.print(Colors.success(f"  • Estimated training speed: {Colors.highlight(f'{estimated_tokens_per_second:.1f}')} tokens/sec"))
-
-            # Calculate training time estimate
-            estimated_hours = (target_tokens / estimated_tokens_per_second) / 3600
-
-            # Format time estimate nicely
-            if estimated_hours < 1:
-                time_str = f"{estimated_hours * 60:.1f} minutes"
-            else:
-                days = int(estimated_hours // 24)
-                hours = int(estimated_hours % 24)
-                minutes = int((estimated_hours * 60) % 60)
-                if days > 0:
-                    time_str = f"{days}d {hours}h {minutes}m"
-                else:
-                    time_str = f"{hours}h {minutes}m"
-
-            training_console.print(Colors.info(f"  • Estimated training time: {Colors.highlight(time_str)}"))
-        else:
-            training_console.print(Colors.warning(f"\n  🚫 Training time estimation skipper due to previous error"))
-    except Exception as e:
-        display_exception(exception=e, msg="❌ Unable to estimate training time")
-        run_status = "failed"
-
-    try:
-        if run_status == "setup":
-            # Calculate warmup steps (e.g., 8% of total steps)
-            warmup_steps = int(0.08 * total_steps)
-
             # Create scheduler
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=warmup_steps,
-                num_training_steps=total_steps
+            scheduler = TokenBasedCosineLRScheduler(
+                optimizer=optimizer,
+                target_total_tokens=target_tokens,
+                max_lr=LEARNING_RATE,
+                warmup_ratio=0.08
             )
 
             # Initialize wandb (optional)
@@ -930,7 +1137,7 @@ def main():
                     "job_name": args.run_name+"-"+datetime.datetime.now().strftime("%b%d"),
                     "model_def": {
                         "parameters": total_params,
-                        "seq_length": args.seq_length,
+                        "seq_length": MAX_SEQ_LENGTH,
                         "hidden_dim": HIDDEN_DIM,
                         "num_heads": NUM_HEADS,
                         "num_layers": NUM_LAYERS,
@@ -941,12 +1148,12 @@ def main():
                         "compressed_head_dim": COMPRESSED_HEAD_DIM,
                         "kv_latent_dim": KV_LATENT_DIM,
                         "q_latent_dim": Q_LATENT_DIM,
-                        "source": "255m_params.json" if model_def else "default values"
+                        "source": model_def if model_def else "default values"
                     },
                     "training_def": {
-                        "batch_size": args.batch_size,
-                        "learning_rate": args.learning_rate,
-                        "gradient_accumulation_steps": args.grad_acc_steps,
+                        "batch_size": BATCH_SIZE,
+                        "learning_rate": LEARNING_RATE,
+                        "gradient_accumulation_steps": GRAD_STEPS,
                         "optimizer": "Adam8Bit" if "8bit" in optimizer.__class__.__name__ else "AdamW",
                         "dropout": DROPOUT,
                         "grad_checkpoints": args.use_checkpointing,
@@ -986,15 +1193,13 @@ def main():
                 scheduler=scheduler,
                 device=device,
                 total_parameters=total_params,
-                gradient_accumulation_steps=args.grad_acc_steps,
+                gradient_accumulation_steps=GRAD_STEPS,
                 checkpoint_dir="checkpoints",
                 use_amp=False,
                 eval_interval=eval_interval,
-                global_steps=total_steps,
                 wandb=wandb,
                 allow_amp_switch=args.allow_amp_switchover,
                 console=training_console,
-                dataset_size=train_dataset.effective_total_tokens,
             )
             run_status = "training"
             trained_tokens, run_status = trainer.run()
@@ -1052,8 +1257,6 @@ def main():
 
                     # Dataset information
                     "run/total_tokens_processed": total_tokens,
-                    "run/dataset_size_tokens": train_dataset.total_tokens if hasattr(train_dataset, "total_tokens") else 0,
-                    "run/dataset_size_examples": len(train_dataset),
 
                     # Hardware information
                     "run/gpu_name": gpu_name,

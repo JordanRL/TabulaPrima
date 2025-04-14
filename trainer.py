@@ -109,11 +109,9 @@ class Trainer:
             use_amp=False,
             log_interval=10,
             eval_interval=100,
-            global_steps=None,
             wandb=None,
             allow_amp_switch=False,
             console: Console|None = None,
-            dataset_size=1,
     ):
         self.model = model
         self.train_dataloader = train_dataloader
@@ -147,7 +145,6 @@ class Trainer:
         self.model_dir = model_dir
         self.log_interval = log_interval
         self.eval_interval = eval_interval
-        self.global_steps = global_steps or len(train_dataloader)
         self.target_tokens = total_parameters * 10
         self.wandb = wandb
         self.scaler = torch.amp.GradScaler() if self.training_state.use_amp else None
@@ -162,7 +159,6 @@ class Trainer:
         self.use_cache = False
         self.allow_amp_switch = allow_amp_switch
         self.console = console or Console()
-        self.dataset_size = dataset_size
 
     def run(self):
         self.model.train()
@@ -198,24 +194,9 @@ class Trainer:
             field4=0.0,
         )
         eval_interval_steps = max(1, self.eval_interval)
-        epoch = 0
 
         try:
             while self.total_tokens < self.target_tokens:
-                epoch_task = progress_bar.add_task(
-                    description=f"Epoch {epoch + 1}",
-                    total=len(self.train_dataloader),
-                    field1_name="Batches",
-                    field1=f"{len(self.train_dataloader):,}",
-                    field2_name="Tok/Batch",
-                    field2=f"{self.dataset_size/len(self.train_dataloader):.2f}",
-                    field3_name="Avg",
-                    field3=0,
-                    field4_name=":",
-                    field4="",
-                )
-                tokens_this_epoch = 0
-                batches_this_epoch = 0
                 for batch in self.train_dataloader:
                     # Move batch to device
                     self.input_ids = batch['input_ids'].to(self.device)
@@ -229,7 +210,6 @@ class Trainer:
                     eval_dict = {}
 
                     # Increment
-                    batches_this_epoch += 1
                     self.training_state.inference_steps += 1
 
                     # Forward pass with mixed precision
@@ -278,15 +258,9 @@ class Trainer:
 
                     # Update tracking metrics
                     self.total_tokens += actual_tokens_in_batch
-                    tokens_this_epoch += actual_tokens_in_batch
 
                     self._update_metrics(loss, actual_tokens_in_batch)
 
-                    progress_bar.update(
-                        epoch_task,
-                        advance=1,
-                        field3=f"{tokens_this_epoch/batches_this_epoch:.2f}",
-                    )
                     progress_bar.update(
                         training_task,
                         advance=actual_tokens_in_batch,
@@ -305,7 +279,7 @@ class Trainer:
                             "training/learning_rate": self.scheduler.get_last_lr()[0],
                             "training/tokens_per_second": self.tokens_per_sec,
                             "training/grad_norm": grad_norm,
-                            "metric/progress": self.training_state.optimizer_steps / self.global_steps
+                            "metric/progress": self.total_tokens / self.target_tokens
                         }
 
                         if self.training_state.steps_since_eval > 0 and self.training_state.optimizer_steps % eval_interval_steps == 0 and self.training_state.optimizer_steps > 0 and self.training_state.run_phase != "warmup":
@@ -345,12 +319,6 @@ class Trainer:
                         self.save_checkpoint()
                         last_checkpoint_time = time.time()
 
-                epoch += 1
-                self.console.print(Colors.success(f"Epoch {epoch} completed."))
-                self.console.print(Colors.info(f"  • Observed tokens: {Colors.highlight(f'{tokens_this_epoch:,}')}"))
-                self.console.print(Colors.info(f"  • Observed average tokens per batch: {Colors.highlight(f'{tokens_this_epoch/batches_this_epoch:.2f}')}"))
-                progress_bar.stop_task(epoch_task)
-                progress_bar.remove_task(epoch_task)
                 if self.total_tokens >= self.target_tokens:
                     break
 
@@ -388,7 +356,7 @@ class Trainer:
             progress_bar = Progress(console=self.console, transient=True, expand=True)
             progress_bar.start()
         eval_task = progress_bar.add_task(
-            description=f"Eval [Dataset]", total=len(self.test_dataloader),
+            description=f"Eval [Dataset]", total=1000,
             field1_name="", field1="", field2_name="", field2="", field3_name="", field3="", field4_name="", field4="",
         )
 
@@ -457,7 +425,6 @@ class Trainer:
         avg_loss = total_loss / len(self.test_dataloader)
         accuracy = total_correct / total_tokens if total_tokens > 0 else 0
         perplexity = math.exp(avg_loss)
-        # TODO: Implement normalized accuracy
 
         # Return to training mode
         self.model.train()
@@ -490,7 +457,7 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_value)
             self.optimizer.step()
 
-        self.scheduler.step()
+        self.scheduler.step(self.total_tokens)
         self.optimizer.zero_grad()
 
     def _bidirectional(self):
