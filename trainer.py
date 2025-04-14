@@ -308,23 +308,22 @@ class Trainer:
                             "metric/progress": self.training_state.optimizer_steps / self.global_steps
                         }
 
-                    if self.training_state.steps_since_eval > 0 and self.training_state.optimizer_steps % eval_interval_steps == 0 and self.training_state.optimizer_steps > 0 and self.training_state.run_phase != "warmup":
-                        # Run evaluation
-                        eval_results = self.evaluate(progress_bar=progress_bar)
-                        self.training_state.steps_since_eval = 0
-                        test_loss = eval_results.loss
-                        test_accuracy = eval_results.accuracy
-                        test_perplexity = eval_results.perplexity
+                        if self.training_state.steps_since_eval > 0 and self.training_state.optimizer_steps % eval_interval_steps == 0 and self.training_state.optimizer_steps > 0 and self.training_state.run_phase != "warmup":
+                            # Run evaluation
+                            eval_results = self.evaluate(progress_bar=progress_bar)
+                            self.training_state.steps_since_eval = 0
+                            test_loss = eval_results.loss
+                            test_accuracy = eval_results.accuracy
+                            test_perplexity = eval_results.perplexity
 
-                        self.training_state.eval_history.append(eval_results)
+                            self.training_state.eval_history.append(eval_results)
 
-                        eval_dict = {
-                            "eval/test_loss": test_loss,
-                            "eval/test_perplexity": test_perplexity,
-                            "eval/test_accuracy": test_accuracy,
-                            "metric/progress": self.training_state.optimizer_steps / self.global_steps,
-                        }
-                        self.model.train()
+                            eval_dict = {
+                                "eval/test_loss": test_loss,
+                                "eval/test_perplexity": test_perplexity,
+                                "eval/test_accuracy": test_accuracy,
+                            }
+                            self.model.train()
 
                     log_dict = {}
                     if training_dict is not None:
