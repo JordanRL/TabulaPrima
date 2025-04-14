@@ -186,7 +186,7 @@ class Trainer:
         )
         progress_bar.start()
         training_task = progress_bar.add_task(
-            description=f"Pretrain [{self.training_state.run_phase.title()}] ({self._precision_mode()})",
+            description=f"Phase: {self.training_state.run_phase.title()} ({self._precision_mode()})",
             total=self.target_tokens,
             field1_name="Loss",
             field1=float('inf'),
