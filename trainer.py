@@ -147,7 +147,7 @@ class Trainer:
         self.eval_interval = eval_interval
         self.target_tokens = total_parameters * 10
         self.wandb = wandb
-        self.scaler = torch.amp.GradScaler() if self.training_state.use_amp else None
+        self.scaler = torch.amp.GradScaler() if self.training_state.use_amp and not torch.cuda.is_bf16_supported() else None
         self.input_ids = None
         self.attention_mask = None
         self.labels = None
