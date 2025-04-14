@@ -1,6 +1,6 @@
 {
-  "BATCH_SIZE": 32,
-  "GRAD_STEPS": 1,
+  "BATCH_SIZE": 16,
+  "GRAD_STEPS": 2,
   "DROPOUT": 0,
   "LEARNING_RATE": 1e-4,
   "TOK_PER_PARAM": 15,
