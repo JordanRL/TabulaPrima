@@ -178,6 +178,7 @@ def parse_args():
     parser.add_argument("--model-dir", type=str, default="models", help="Directory to save final model")
     parser.add_argument("--use-checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")
     parser.add_argument("--allow-amp-switchover", action="store_true", help="Allows the training run to switch over to mixed precision once it reaches stability")
+    parser.add_argument("--use-amp", action="store_true", help="Starts training in mixed precision")
 
     return parser.parse_args()
 
@@ -1195,7 +1196,7 @@ def main():
                 total_parameters=total_params,
                 gradient_accumulation_steps=GRAD_STEPS,
                 checkpoint_dir="checkpoints",
-                use_amp=False,
+                use_amp=args.use_amp,
                 eval_interval=eval_interval,
                 wandb=wandb,
                 allow_amp_switch=args.allow_amp_switchover,
