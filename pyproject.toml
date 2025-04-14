@@ -6,12 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "TabulaPrima"
 version = "0.1.0"
 description = "MLA Transformer for testing pre-training vs fine-tuning hypothesis"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 authors = [
     {name = "Jordan LeDoux", email = "jordan.ledoux@gmail.com"}
 ]
 classifiers = [
-    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.11",
     "Operating System :: OS Independent",
 ]
 dependencies = [
