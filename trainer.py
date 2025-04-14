@@ -254,8 +254,7 @@ class Trainer:
                             self.pre_clip_grad_norm += param.grad.data.norm(2).item() ** 2
                     self.pre_clip_grad_norm = self.pre_clip_grad_norm ** 0.5
 
-                    if self.allow_amp_switch:
-                        self._precision_phase(start_time)
+                    self._precision_phase(start_time)
 
                     # Update weights after accumulating gradients
                     if self.training_state.inference_steps % self.gradient_accumulation_steps == 0:
