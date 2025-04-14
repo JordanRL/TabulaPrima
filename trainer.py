@@ -539,13 +539,14 @@ class Trainer:
             if elapsed_time > 60:
                 str_time = f"{elapsed_time % 60:.2f}s"
                 elapsed_time = elapsed_time / 60
-                str_time = f"{int(elapsed_time % 60)}m " + str_time
-                elapsed_time = elapsed_time / 60
-                if elapsed_time > 60:
-                    str_time = f"{int(elapsed_time / 60)}h " + str_time
-                    elapsed_time = elapsed_time / 24
+                if elapsed_time > 1:
+                    str_time = f"{int(elapsed_time % 60)}m " + str_time
+                    elapsed_time = elapsed_time / 60
                     if elapsed_time > 1:
-                        str_time = f"{int(elapsed_time)}d " + str_time
+                        str_time = f"{int(elapsed_time % 24)}h " + str_time
+                        elapsed_time = elapsed_time / 24
+                        if elapsed_time > 1:
+                            str_time = f"{int(elapsed_time)}d " + str_time
             else:
                 str_time = f"{elapsed_time:.2f}s"
 
