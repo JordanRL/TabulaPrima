@@ -872,6 +872,7 @@ def run_training(args):
             training_console.update_progress_task("application", advance=1, description="Model Initialization")
             # Create model instance
             vocab_size = tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else 50257
+            torch.set_float32_matmul_precision('high')
             model = MLATransformer(
                 vocab_size=vocab_size,
                 hidden_dim=HIDDEN_DIM,
