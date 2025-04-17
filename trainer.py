@@ -7,10 +7,13 @@ import torch.nn.functional as F
 import os
 import time
 
+from rich.live import Live
 from rich.table import Column
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, \
-    TimeRemainingColumn
+    TimeRemainingColumn, TaskID
+
+from console import TPConsole
 
 
 # Console colors for better readability
@@ -63,6 +66,7 @@ class TrainingState:
     token_times: list[float]
     grad_norm_history: list[float]
     eval_history: list[EvaluationResult]
+    target_tokens: int
 
     # Training progress
     batches_seen: int
@@ -137,6 +141,7 @@ class Trainer:
             stability_reached=False,
             checkpoint_interval=60 * 60 * 4,
             use_amp=use_amp,
+            target_tokens=total_parameters * 10
         )
         self.total_parameters = total_parameters
         self.gradient_accumulation_steps = gradient_accumulation_steps
@@ -158,7 +163,7 @@ class Trainer:
         self.tokens_per_sec = 0
         self.use_cache = False
         self.allow_amp_switch = allow_amp_switch
-        self.console = console or Console()
+        self.console = TPConsole()
 
     def run(self):
         self.model.train()
@@ -166,33 +171,12 @@ class Trainer:
         # Create checkpoint directory
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
+        self.console.create_progress_task("training", f"Phase: {self.training_state.run_phase.title()} ({self._precision_mode()})", total=self.target_tokens)
+
         # Tracking training dynamics
         start_time = time.time()
         last_checkpoint_time = start_time
-        spinner_col = SpinnerColumn(table_column=Column(max_width=3))
-        desc_col = TextColumn(text_format="{task.description}", style=Colors.CYAN, table_column=Column(max_width=30))
-        bar_col = BarColumn(bar_width=None, complete_style="#4B6BFF")
-        pct_col = TaskProgressColumn(table_column=Column(max_width=10))
-        time_elapsed_col = TimeElapsedColumn(table_column=Column(max_width=15))
-        time_remaining_col = TimeRemainingColumn(table_column=Column(max_width=15))
-        metadata_col = TextColumn(text_format="{task.fields[field1_name]}: {task.fields[field1]} {task.fields[field2_name]}: {task.fields[field2]} {task.fields[field3_name]}: {task.fields[field3]} {task.fields[field4_name]}: {task.fields[field4]}", style=Colors.BLUE, table_column=Column(min_width=40))
-        progress_bar = Progress(
-            spinner_col, desc_col, bar_col, pct_col, time_elapsed_col, time_remaining_col, metadata_col,
-            console=self.console, transient=True, expand=True
-        )
-        progress_bar.start()
-        training_task = progress_bar.add_task(
-            description=f"Phase: {self.training_state.run_phase.title()} ({self._precision_mode()})",
-            total=self.target_tokens,
-            field1_name="Loss",
-            field1=float('inf'),
-            field2_name="PPL",
-            field2=float('inf'),
-            field3_name="Grad",
-            field3=float('inf'),
-            field4_name="TPS",
-            field4=0.0,
-        )
+
         eval_interval_steps = max(1, self.eval_interval)
 
         try:
@@ -217,7 +201,7 @@ class Trainer:
 
                     if loss.item() > 100:
                         self.console.print(Colors.warning(f"Extremely high loss detected: {loss.item():.2f}. Check model initialization."))
-                        progress_bar.stop()
+                        self.console.remove_progress_task("training")
                         return self.total_tokens, "failed"
 
                     # Early in training, clip loss for stability
@@ -247,7 +231,7 @@ class Trainer:
                         self._backprop(grad_clip_value=grad_clip_value)
                         if self.training_state.run_phase == "warmup" and self.training_state.stability_reached == True:
                             self.training_state.run_phase = "core learning"
-                            progress_bar.update(training_task, description=f"Phase: {self.training_state.run_phase.title()} ({self._precision_mode()})")
+                            self.console.update_progress_task("training", description=f"Phase: {self.training_state.run_phase.title()} ({self._precision_mode()})")
 
                             if self.allow_amp_switch and self.training_state.use_amp == False:
                                 self.training_state.use_amp = True
@@ -261,14 +245,19 @@ class Trainer:
 
                     self._update_metrics(loss, actual_tokens_in_batch)
 
-                    progress_bar.update(
-                        training_task,
-                        advance=actual_tokens_in_batch,
-                        field1=f"{self.current_loss:.4f}",
-                        field2=f"{self.current_perplexity:.2f}",
-                        field3=f"{self.pre_clip_grad_norm:.4f}",
-                        field4=f"{self.tokens_per_sec:.1f}",
+                    self.console.update_progress_task(
+                        "training",
+                        advance=actual_tokens_in_batch
                     )
+                    self.console.update_app_stats({
+                        "Tokens/s": f"{self.tokens_per_sec:.2f}",
+                        "Loss": f"{self.current_loss:.4f}",
+                        "Perplexity": f"{self.current_perplexity:.4f}",
+                        "Grad Norm": f"{self.pre_clip_grad_norm:.4f}",
+                        "Steps Since Instrument": self.training_state.steps_since_instrument,
+                        "Steps Since Eval": self.training_state.steps_since_eval,
+                        "Learning Rate": f"{self.scheduler.get_last_lr()[0]:.6f}"
+                    })
 
                     if (self.training_state.steps_since_instrument == self.log_interval or self.training_state.optimizer_steps % eval_interval_steps == 0) and self.training_state.steps_since_instrument > 0 and self.training_state.optimizer_steps > 0:
                         self.training_state.steps_since_instrument = 0
@@ -284,7 +273,7 @@ class Trainer:
 
                         if self.training_state.steps_since_eval > 0 and self.training_state.optimizer_steps % eval_interval_steps == 0 and self.training_state.optimizer_steps > 0 and self.training_state.run_phase != "warmup":
                             # Run evaluation
-                            eval_results = self.evaluate(progress_bar=progress_bar)
+                            eval_results = self.evaluate()
                             self.training_state.steps_since_eval = 0
                             test_loss = eval_results.loss
                             test_accuracy = eval_results.accuracy
@@ -313,7 +302,7 @@ class Trainer:
 
                     if self.training_state.run_phase == "core learning" and self.total_tokens >= self.target_tokens*0.8:
                         self.training_state.run_phase = "refinement"
-                        progress_bar.update(training_task, description=f"Phase: {self.training_state.run_phase.title()} ({self._precision_mode()})")
+                        self.console.update_progress_task("training", description=f"Phase: {self.training_state.run_phase.title()} ({self._precision_mode()})")
 
                     if (time.time() - last_checkpoint_time) >= self.training_state.checkpoint_interval:
                         self.save_checkpoint()
@@ -322,17 +311,11 @@ class Trainer:
                 if self.total_tokens >= self.target_tokens:
                     break
 
-            progress_bar.stop()
+            self.console.remove_progress_task("training")
             return self.total_tokens, "success"
         except KeyboardInterrupt:
-            progress_bar.stop_task(training_task)
-            progress_bar.remove_task(training_task)
-            progress_bar.stop()
             raise KeyboardInterrupt
         except Exception as e:
-            progress_bar.stop_task(training_task)
-            progress_bar.remove_task(training_task)
-            progress_bar.stop()
             raise e
 
     def save_checkpoint(self):
@@ -351,18 +334,13 @@ class Trainer:
         total_loss = 0
         total_correct = 0
         total_tokens = 0
+        batch_counter = 0
 
-        if progress_bar is None:
-            progress_bar = Progress(console=self.console, transient=True, expand=True)
-            progress_bar.start()
-        eval_task = progress_bar.add_task(
-            description=f"Eval [Dataset]", total=1000,
-            field1_name="", field1="", field2_name="", field2="", field3_name="", field3="", field4_name="", field4="",
-        )
+        self.console.create_progress_task("eval", "Evaluating", total=1000)
 
         with torch.no_grad():
             for batch in self.test_dataloader:
-                progress_bar.advance(eval_task)
+                batch_counter += 1
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
@@ -419,11 +397,13 @@ class Trainer:
 
                 total_loss += loss.item()
 
-        progress_bar.remove_task(eval_task)
+                self.console.update_progress_task("eval", advance=1)
+
+        self.console.remove_progress_task("eval")
 
         # Calculate final metrics
-        avg_loss = total_loss / len(self.test_dataloader)
-        accuracy = total_correct / total_tokens if total_tokens > 0 else 0
+        avg_loss = (total_loss / batch_counter) if batch_counter > 0 else 0
+        accuracy = (total_correct / total_tokens) if total_tokens > 0 else 0
         perplexity = math.exp(avg_loss)
 
         # Return to training mode

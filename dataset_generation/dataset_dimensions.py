@@ -26,6 +26,21 @@ class DatasetDimensionValue:
     choice: DimensionChoice
     dimension: DatasetDimension
 
+    def __dict__(self):
+        return {
+            'choice': {
+                'value': self.choice.value,
+                'description': self.choice.description,
+                'instruction': self.choice.instruction,
+                'goal': self.choice.goal,
+                'weight': self.choice.weight
+            },
+            'dimension': {
+                'name': self.dimension.name,
+                'description': self.dimension.description
+            }
+        }
+
 # -----------------------------
 # Dimension 1: Content Focus
 # -----------------------------
@@ -678,12 +693,25 @@ class EmotionalValenceStyleDimensionValue(DatasetDimensionValue):
 @dataclass
 class DatasetExampleDimensions:
     content_focus: ContentFocusDimensionValue
+    format: FormatDimensionValue
+    domain_emphasis: DomainEmphasisDimensionValue
     reasoning: ReasoningDimensionValue
     conceptual_complexity: ConceptualComplexityDimensionValue
     ambiguity_level: AmbiguityLevelDimensionValue
     factual_density: FactualDensityDimensionValue
     temporal_focus: TemporalFocusDimensionValue
     emotional_valence_style: EmotionalValenceStyleDimensionValue
+
+    def __dict__(self):
+        return {
+            'content_focus': self.content_focus.__dict__(),
+            'format': self.format.__dict__(),
+            'domain_emphasis': self.domain_emphasis.__dict__(),
+            'reasoning': self.reasoning.__dict__(),
+            'conceptual_complexity': self.conceptual_complexity.__dict__(),
+            'factual_density': self.factual_density.__dict__(),
+            'emotional_valence_style': self.emotional_valence_style.__dict__(),
+        }
 
 # --- Helper function to get all dimensions ---
 def get_all_dimensions() -> list[DatasetDimension]:

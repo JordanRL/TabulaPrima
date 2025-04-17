@@ -87,7 +87,8 @@ class MultiHeadLatentAttention(nn.Module):
                  q_latent_dim,
                  rope_head_dim,
                  dropout,
-                 max_seq_len):
+                 max_seq_len,
+                 use_fusion=False,):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
@@ -103,26 +104,43 @@ class MultiHeadLatentAttention(nn.Module):
              raise ValueError("Rope head dimension must be smaller than the full head dimension.")
 
         # --- Projections based on DeepSeek V2 Equations ---
-        # Eq (9): KV Down-projection (Shared)
-        self.kv_down_proj = nn.Linear(hidden_dim, kv_latent_dim, bias=False) # W_DKV
+        if use_fusion:
+            # Fused down-projection: hidden_dim -> [kv_latent_dim, q_latent_dim]
+            self.down_proj = nn.Linear(hidden_dim, kv_latent_dim + q_latent_dim, bias=False)
+        else:
+            # Eq (9): KV Down-projection (Shared)
+            self.kv_down_proj = nn.Linear(hidden_dim, kv_latent_dim, bias=False) # W_DKV
+            # Eq (12): Query Down-projection
+            self.q_down_proj = nn.Linear(hidden_dim, q_latent_dim, bias=False) # W_DQ
 
-        # Eq (12): Query Down-projection
-        self.q_down_proj = nn.Linear(hidden_dim, q_latent_dim, bias=False) # W_DQ
+        if use_fusion:
+            self.kv_up_proj = nn.Linear(
+                kv_latent_dim,
+                (self.compressed_head_dim + self.head_dim) * num_heads,
+                bias=False
+            )
+        else:
+            # Eq (10): Key Up-projection (Compressed Content Part)
+            self.k_c_proj = nn.Linear(kv_latent_dim, self.compressed_head_dim * num_heads, bias=False) # W_UK (output dim d_h^C * n_h)
+            # Eq (11): Value Up-projection (Compressed Content Part)
+            self.v_proj = nn.Linear(kv_latent_dim, self.head_dim * num_heads, bias=False) # W_UV (output dim d_h * n_h)
 
-        # Eq (10): Key Up-projection (Compressed Content Part)
-        self.k_c_proj = nn.Linear(kv_latent_dim, self.compressed_head_dim * num_heads, bias=False) # W_UK (output dim d_h^C * n_h)
-
-        # Eq (11): Value Up-projection (Compressed Content Part)
-        self.v_proj = nn.Linear(kv_latent_dim, self.head_dim * num_heads, bias=False) # W_UV (output dim d_h * n_h)
-
-        # Eq (13): Query Up-projection (Compressed Content Part)
-        self.q_c_proj = nn.Linear(q_latent_dim, self.compressed_head_dim * num_heads, bias=False) # W_UQ (output dim d_h^C * n_h)
-
-        # Eq (15): RoPE Key Projection (from hidden_state, shared across heads)
-        self.k_r_proj = nn.Linear(hidden_dim, self.rope_head_dim, bias=False) # W_KR (output dim d_h^R)
-
-        # Eq (14): RoPE Query Projection (from query latent)
-        self.q_r_proj = nn.Linear(q_latent_dim, self.rope_head_dim * num_heads, bias=False) # W_QR (output dim d_h^R * n_h)
+        if use_fusion:
+            # Fused up-projection for Q latent: [Q_c, Q_r] from q_latent_dim
+            self.q_up_proj = nn.Linear(
+                q_latent_dim,
+                (self.compressed_head_dim + self.rope_head_dim) * num_heads,
+                bias=False
+            )
+            # RoPE key‐only projection
+            self.k_r_proj = nn.Linear(hidden_dim, self.rope_head_dim, bias=False)
+        else:
+            # Eq (13): Query Up-projection (Compressed Content Part)
+            self.q_c_proj = nn.Linear(q_latent_dim, self.compressed_head_dim * num_heads, bias=False) # W_UQ (output dim d_h^C * n_h)
+            # Eq (15): RoPE Key Projection (from hidden_state, shared across heads)
+            self.k_r_proj = nn.Linear(hidden_dim, self.rope_head_dim, bias=False) # W_KR (output dim d_h^R)
+            # Eq (14): RoPE Query Projection (from query latent)
+            self.q_r_proj = nn.Linear(q_latent_dim, self.rope_head_dim * num_heads, bias=False) # W_QR (output dim d_h^R * n_h)
 
         # Output projection
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
@@ -134,27 +152,44 @@ class MultiHeadLatentAttention(nn.Module):
         # Flags/Buffers for potential future matrix absorption implementation
         self.generation_ready = False
         self.use_absorption = False
+        self.use_fusion = use_fusion
         # Register buffers for absorbed weights (logic to compute/use them is NOT implemented here)
         self.register_buffer('q_absorbed_weight', None) # Would absorb W_UK
         self.register_buffer('o_absorbed_weight', None) # Would absorb W_UV
 
-    def forward(self, x, past_key_value=None, attention_mask=None, position_ids=None, is_causal=True, use_cache=False):
+    def forward(self, x, past_key_value=None, attention_mask=None, position_ids=None, is_causal=True, use_cache=False, sin_cos=None):
         batch_size, seq_len, _ = x.shape
 
         # --- Compute Latent Vectors ---
-        # Eq (9): Shared KV Latent (for current step)
-        c_kv_cur = self.kv_down_proj(x) # Shape:
-        # Eq (12): Query Latent (for current step)
-        c_q_cur = self.q_down_proj(x)   # Shape:
+        if self.use_fusion:
+            # Fused down-projection
+            down = self.down_proj(x)  # [batch, seq_len, kv_latent + q_latent]
+            c_kv_cur, c_q_cur = down.split(
+                [self.kv_latent_dim, self.q_latent_dim], dim=-1
+            )
+        else:
+            # Eq (9): Shared KV Latent (for current step)
+            c_kv_cur = self.kv_down_proj(x) # Shape:
+            # Eq (12): Query Latent (for current step)
+            c_q_cur = self.q_down_proj(x)   # Shape:
 
         # --- Compute Compressed Components ---
-        # Eq (13): Compressed Query Content
-        q_c = self.q_c_proj(c_q_cur) # Shape:
-        q_c = q_c.view(batch_size, seq_len, self.num_heads, self.compressed_head_dim) # Shape:
+        if self.use_fusion:
+            # Fused up-projection for Q latent: [Q_c_flat | Q_r_flat]
+            q_up = self.q_up_proj(c_q_cur)  # [batch, seq_len, num_heads*(d_h^C + d_h^R)]
+            q_up = q_up.view(
+                batch_size, seq_len, self.num_heads, self.compressed_head_dim + self.rope_head_dim
+            )
+            q_c = q_up[..., : self.compressed_head_dim]
+            q_r = q_up[..., self.compressed_head_dim:]
+        else:
+            # Eq (13): Compressed Query Content
+            q_c = self.q_c_proj(c_q_cur) # Shape:
+            q_c = q_c.view(batch_size, seq_len, self.num_heads, self.compressed_head_dim) # Shape:
 
-        # Eq (14): RoPE Query Component (Before RoPE application)
-        q_r = self.q_r_proj(c_q_cur) # Shape:
-        q_r = q_r.view(batch_size, seq_len, self.num_heads, self.rope_head_dim) # Shape:
+            # Eq (14): RoPE Query Component (Before RoPE application)
+            q_r = self.q_r_proj(c_q_cur) # Shape:
+            q_r = q_r.view(batch_size, seq_len, self.num_heads, self.rope_head_dim) # Shape:
 
         # Eq (15): RoPE Key Component (Shared, Before RoPE application)
         k_r_cur = self.k_r_proj(x) # Shape:
@@ -166,13 +201,11 @@ class MultiHeadLatentAttention(nn.Module):
             # Cache structure: (c_kv_cache, k_r_cache, past_length)
             past_length = past_key_value[1]
 
-        # Get cos/sin for the combined sequence length
-        cos, sin = self.rotary_emb(seq_len=past_length + seq_len) # Shape:
-
-        # Create position_ids if not provided
-        if position_ids is None:
-             position_ids = torch.arange(past_length, past_length + seq_len, dtype=torch.long, device=x.device)
-             position_ids = position_ids.unsqueeze(0).view(-1, seq_len) # Shape:
+        if sin_cos is not None:
+            sin, cos = sin_cos
+        else:
+            # Get cos/sin for the combined sequence length
+            cos, sin = self.rotary_emb(seq_len=past_length + seq_len) # Shape:
 
         # Apply RoPE to q_r and k_r_cur using the correct positions
         q_r = apply_rotary_pos_emb(q_r, cos, sin, position_ids) # Shape:
@@ -200,17 +233,22 @@ class MultiHeadLatentAttention(nn.Module):
             curr_seq_len = seq_len
 
         # --- Compute Full K and V (Explicitly, for non-absorbed inference/training) ---
-        # NOTE: In a fully optimized MLA inference with matrix absorption,
-        # k_c and v would NOT be explicitly computed here. The attention
-        # calculation would use c_kv directly with absorbed matrices.
+        if self.use_fusion:
+            # Fused up-projection for KV latent: [K_c_flat | V_flat]
+            kv_up = self.kv_up_proj(c_kv)  # [batch, curr_seq_len, num_heads*(d_h^C + d_h)]
+            kv_up = kv_up.view(
+                batch_size, curr_seq_len, self.num_heads, self.compressed_head_dim + self.head_dim
+            )
+            k_c = kv_up[..., : self.compressed_head_dim]
+            v = kv_up[..., self.compressed_head_dim:]
+        else:
+            # Eq (10): Compressed Key Content (from potentially cached c_kv)
+            k_c = self.k_c_proj(c_kv) # Shape:
+            k_c = k_c.view(batch_size, curr_seq_len, self.num_heads, self.compressed_head_dim) # Shape:
 
-        # Eq (10): Compressed Key Content (from potentially cached c_kv)
-        k_c = self.k_c_proj(c_kv) # Shape:
-        k_c = k_c.view(batch_size, curr_seq_len, self.num_heads, self.compressed_head_dim) # Shape:
-
-        # Eq (11): Compressed Value (from potentially cached c_kv)
-        v = self.v_proj(c_kv) # Shape:
-        v = v.view(batch_size, curr_seq_len, self.num_heads, self.head_dim) # Shape:
+            # Eq (11): Compressed Value (from potentially cached c_kv)
+            v = self.v_proj(c_kv) # Shape:
+            v = v.view(batch_size, curr_seq_len, self.num_heads, self.head_dim) # Shape:
 
         # --- Prepare for Attention ---
         # Eq (16): Concatenate final Query
@@ -227,42 +265,16 @@ class MultiHeadLatentAttention(nn.Module):
         v = v.transpose(1, 2)
 
         # --- Attention Calculation (Standard Scaled Dot-Product) ---
-        # Note: q shape is, k shape is
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        # Apply causal mask if needed
-        if is_causal:
-            # Create mask for the full sequence length
-            causal_mask = torch.triu(torch.ones(curr_seq_len, curr_seq_len,
-                                                dtype=torch.bool, device=x.device), diagonal=1)
-            # If using cache, only mask the new query tokens against the full key sequence
-            if past_length > 0:
-                 # Select the rows corresponding to the new query tokens
-                 causal_mask_slice = causal_mask[past_length:, :] # Shape
-            else:
-                 causal_mask_slice = causal_mask # Shape
-
-            # Reshape mask for broadcasting: ->
-            causal_mask_slice = causal_mask_slice.unsqueeze(0).unsqueeze(0)
-            # Apply mask to scores (shape)
-            scores = scores.masked_fill(causal_mask_slice, torch.finfo(scores.dtype).min)
-
-
-        # Apply external attention mask (e.g., for padding)
-        if attention_mask is not None:
-            # Expected shape or
-            if attention_mask.dim() == 2: # -> ->
-                attention_mask = attention_mask[:, None, :, None].expand(-1, -1, -1, curr_seq_len)
-            # Add mask values (0 for attend, -inf for ignore)
-            scores = scores + attention_mask
-
-        # Apply softmax and compute weighted sum
-        attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype) # Use float32 for stability
-        attn_weights = self.dropout(attn_weights)
-
-        context = torch.matmul(attn_weights, v) # Shape:
-
-        # Reshape back
+        context = F.scaled_dot_product_attention(
+            query=q,
+            key=k,
+            value=v,
+            attn_mask=attention_mask.unsqueeze(1).unsqueeze(2).bool() if attention_mask is not None else None,
+            dropout_p=self.dropout.p if self.training else 0.0,  # Apply dropout if needed
+            is_causal=is_causal  # Use the causal flag you already have
+        )
+        # context shape is [batch_size, num_heads, seq_len_q, head_dim]
+        # Reshape context back to [batch_size, seq_len_q, hidden_dim]
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_dim)
 
         # Output projection
@@ -283,15 +295,9 @@ class MultiHeadLatentAttention(nn.Module):
             return
 
         # --- TODO: Implement computation of absorbed matrices ---
-        # Example (Conceptual - requires actual derivation):
-        # q_absorbed_weight = compute_absorbed_q_weight(self.q_down_proj, self.q_c_proj, self.k_c_proj)
-        # o_absorbed_weight = compute_absorbed_o_weight(self.v_proj, self.out_proj)
-        # self.register_buffer('q_absorbed_weight', q_absorbed_weight)
-        # self.register_buffer('o_absorbed_weight', o_absorbed_weight)
 
         self.generation_ready = True
         print("Warning: Matrix absorption computation in prepare_for_generation is not implemented.")
-
 
     def set_use_absorption(self, use_absorption):
         """Toggle whether to use matrix absorption during inference (if implemented)."""
@@ -336,7 +342,8 @@ class TransformerLayer(nn.Module):
             dropout,
             max_seq_len,
             rope_head_dim,
-            use_checkpointing=False
+            use_checkpointing=False,
+            use_fusion=False,
     ):
         super().__init__()
         self.attention = MultiHeadLatentAttention(
@@ -347,6 +354,7 @@ class TransformerLayer(nn.Module):
             rope_head_dim=rope_head_dim,
             dropout=dropout,
             max_seq_len=max_seq_len,
+            use_fusion=use_fusion,
         )
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
@@ -354,19 +362,20 @@ class TransformerLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.use_checkpointing = use_checkpointing
 
-    def _attention_block(self, normalized_x, attention_mask, position_ids, past_key_value, use_cache):
+    def _attention_block(self, normalized_x, attention_mask, position_ids, past_key_value, use_cache, sin_cos):
         return self.attention(
             normalized_x,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
-            use_cache=use_cache
+            use_cache=use_cache,
+            sin_cos=sin_cos,
         )
 
     def _ff_block(self, x):
         return self.ff(self.norm2(x))
 
-    def forward(self, x, attention_mask=None, past_key_value=None, use_cache=False, position_ids=None):
+    def forward(self, x, attention_mask=None, past_key_value=None, use_cache=False, position_ids=None, sin_cos=None):
         # First sublayer: MLA with residual connection
         normalized_x = self.norm1(x)
 
@@ -374,7 +383,7 @@ class TransformerLayer(nn.Module):
             # Use checkpointing for attention if not using KV cache
             attn_output, _ = checkpoint(
                 self._attention_block,
-                normalized_x, attention_mask, position_ids, None, False,
+                normalized_x, attention_mask, position_ids, None, False, sin_cos,
                 use_reentrant=False,
             )
             # No KV cache with checkpointing
@@ -386,7 +395,8 @@ class TransformerLayer(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_value,
-                use_cache=use_cache
+                use_cache=use_cache,
+                sin_cos=sin_cos,
             )
 
         x = x + self.dropout(attn_output)
@@ -419,13 +429,17 @@ class MLATransformer(nn.Module):
             dropout,
             max_seq_len,
             rope_head_dim,
-            use_checkpointing=False
+            use_checkpointing=False,
+            use_fusion=False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.embedding = nn.Embedding(vocab_size, hidden_dim)
         self.use_checkpointing = use_checkpointing
         self.num_heads = num_heads
+
+        # Rotary embeddings (initialized with RoPE dimension d_h^R)
+        self.rotary_emb = RotaryEmbedding(dim=rope_head_dim, max_seq_len=max_seq_len)
 
         # Use torch.nn.ModuleList for better memory efficiency with checkpoint
         self.layers = nn.ModuleList([
@@ -438,7 +452,8 @@ class MLATransformer(nn.Module):
                 dropout=dropout,
                 max_seq_len=max_seq_len,
                 rope_head_dim=rope_head_dim,
-                use_checkpointing=use_checkpointing
+                use_checkpointing=use_checkpointing,
+                use_fusion=use_fusion
             )
             for _ in range(num_layers)
         ])
@@ -454,6 +469,13 @@ class MLATransformer(nn.Module):
 
         # Flag for generation optimization
         self.generation_ready = False
+
+        # position_ids_buffer
+        self.register_buffer(
+            'position_ids_buffer',
+            torch.arange(max_seq_len, dtype=torch.long),
+            persistent=False
+        )
 
     def set_layer_bf16(self, i: int):
         self.layers[i].bfloat16()
@@ -516,9 +538,11 @@ class MLATransformer(nn.Module):
             # Assuming cache structure is (c_kv_cache, k_r_cache, past_len)
             past_length = past_key_values[2]
 
-        position_ids = torch.arange(past_length, past_length + seq_len, dtype=torch.long, device=input_ids.device)
+        pid = self.position_ids_buffer[past_length : past_length+seq_len]
         # Expand position_ids to match batch size
-        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+        position_ids = pid.to(input_ids.device).unsqueeze(0).expand(batch_size, -1)
+
+        cos, sin = self.rotary_emb(seq_len=past_length + seq_len)
         # --- End position_ids generation ---
 
         # Embed tokens and positions
@@ -536,7 +560,8 @@ class MLATransformer(nn.Module):
                 attention_mask=attention_mask,
                 past_key_value=layer_past_key_value,
                 use_cache=use_cache,
-                position_ids=position_ids  # Pass generated position_ids
+                position_ids=position_ids,
+                sin_cos=(sin, cos)
             )
 
             # Unpack output based on use_cache
