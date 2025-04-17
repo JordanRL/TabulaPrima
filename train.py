@@ -1,6 +1,6 @@
 import argparse
 
-from console import Colors, TPConsole
+from console import TPConsole
 from train_harness import run_training
 
 
@@ -41,13 +41,16 @@ def parse_args():
 
 # Main training script with improvements for 2070 Super
 def main():
+    training_console = TPConsole(use_live=args.use_live_display)
+    training_console.progress_start(use_stats=True)
+    training_console.create_progress_task("application", "Bootstrap", total=14, is_app_task=True)
     run_training(args)
 
 
 if __name__ == "__main__":
     args = parse_args()
-    training_console = TPConsole(use_live=args.use_live_display)
-    training_console.progress_start(use_stats=True)
-    training_console.create_progress_task("application", "Bootstrap", total=14, is_app_task=True)
+    if args.bootstrap:
+        from bootstrap import run_bootstrap
+        run_bootstrap()
 
     main()

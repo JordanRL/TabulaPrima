@@ -40,6 +40,9 @@ test = [
     "pytest-cov>=4.0.0",
 ]
 
+[tool.setuptools]
+packages=[]
+
 [tool.black]
 line-length = 88
 target-version = ["py312"]

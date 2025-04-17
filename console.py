@@ -1,6 +1,5 @@
 from time import sleep
 
-from colour import Color
 from pyfiglet import Figlet
 from rich.console import Console, Group
 from rich.box import Box
@@ -74,6 +73,7 @@ class Colors:
 
     @staticmethod
     def apply_gradient_to_lines(text, color_top, color_bottom, padding_top=False, padding_bottom=False):
+        from colour import Color
         # 1. Split the string into a list of lines
         lines = text.splitlines()
 
@@ -124,6 +124,7 @@ class Colors:
 
     @staticmethod
     def apply_gradient_to_chars(text, color_start, color_end):
+        from colour import Color
         num_chars = len(text)
 
         color_start = Color(color_start)
