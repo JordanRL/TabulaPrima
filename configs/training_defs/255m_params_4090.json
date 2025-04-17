@@ -1,5 +1,5 @@
 {
-  "BATCH_SIZE": 8,
+  "BATCH_SIZE": 6,
   "GRAD_STEPS": 6,
   "DROPOUT": 0,
   "LEARNING_RATE": 5e-5,
