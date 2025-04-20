@@ -1,6 +1,3 @@
-import contextlib
-import io
-import json
 import logging
 import math
 import datetime
@@ -10,8 +7,10 @@ import traceback
 from traceback import FrameSummary
 from typing import Optional, Dict, Any, List
 
+import hydra.utils
 import tiktoken
 import torch
+from omegaconf import OmegaConf
 from torch.optim import Optimizer
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
@@ -20,35 +19,15 @@ import time
 from tqdm import tqdm
 import wandb
 from datasets import load_dataset
+
+from config_schema import Config
 from console import Colors, TPConsole
-
-
-# Default model definition params
-# These will be overwritten after parsing arguments and loading the model def
-model_def = {}
-HIDDEN_DIM = 1152
-NUM_LAYERS = 12
-NUM_HEADS = 9
-HEAD_DIM = HIDDEN_DIM // NUM_HEADS
-FF_DIM = 4608
-MLA_LATENT_DIM = 288
-MAX_SEQ_LENGTH = 512
-ROPE_HEAD_DIM = HEAD_DIM // 4
-COMPRESSED_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
-KV_LATENT_DIM = MLA_LATENT_DIM
-Q_LATENT_DIM = MLA_LATENT_DIM
-
-# Training defaults
-DROPOUT = 0.0
-BATCH_SIZE = 1
-GRAD_STEPS = 8
-LEARNING_RATE = 5e-5
-TOK_PER_PARAM = 10
-WEIGHT_DECAY = 0.01
+from model_arch import MLATransformer
+from trainer import Trainer
 
 # Training Dataset
 class TextDataset(Dataset):
-    def __init__(self, file_path, tokenizer, max_length=MAX_SEQ_LENGTH):
+    def __init__(self, file_path, tokenizer, max_length):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.examples = []
@@ -76,7 +55,7 @@ class TextDataset(Dataset):
 
 
 class HFDataset(Dataset):
-    def __init__(self, tokenizer, dataset_path, dataset_name=None, seq_length=MAX_SEQ_LENGTH, split="train"):
+    def __init__(self, tokenizer, dataset_path, seq_length, dataset_name=None, split="train"):
         """
         Initialize the dataset from Hugging Face.
 
@@ -506,58 +485,8 @@ class TokenBasedCosineLRScheduler:
                 f"warmup_tokens={self._warmup_tokens}, "
                 f"current_tokens={self._current_tokens})")
 
-def run_training(args):
+def run_training(cfg: Config):
     training_console = TPConsole()
-
-    from model_arch import MLATransformer
-    from trainer import Trainer
-
-    # Load model definition from JSON file
-    global model_def, HIDDEN_DIM, NUM_LAYERS, NUM_HEADS, HEAD_DIM, FF_DIM, MLA_LATENT_DIM
-    global MAX_SEQ_LENGTH, ROPE_HEAD_DIM, COMPRESSED_HEAD_DIM, KV_LATENT_DIM, Q_LATENT_DIM
-    global DROPOUT, BATCH_SIZE, GRAD_STEPS, LEARNING_RATE, TOK_PER_PARAM, WEIGHT_DECAY
-
-    model_def_path = os.path.join('configs', 'model_defs', args.model_def)
-    train_def_path = os.path.join('configs', 'training_defs', args.train_def)
-    try:
-        training_console.update_progress_task("application", advance=1, description="Model Configs")
-        with open(model_def_path, 'r') as f:
-            model_def = json.load(f)
-        training_console.print(Colors.success(f"✓ Successfully loaded model definition from {args.model_def}"))
-
-        # Update model parameters from the loaded definition
-        HIDDEN_DIM = model_def.get('HIDDEN_DIM', HIDDEN_DIM)
-        NUM_LAYERS = model_def.get('NUM_LAYERS', NUM_LAYERS)
-        NUM_HEADS = model_def.get('NUM_HEADS', NUM_HEADS)
-        HEAD_DIM = model_def.get('HEAD_DIM', HIDDEN_DIM // NUM_HEADS)
-        FF_DIM = model_def.get('FF_DIM', FF_DIM)
-        MLA_LATENT_DIM = model_def.get('MLA_LATENT_DIM', MLA_LATENT_DIM)
-        MAX_SEQ_LENGTH = model_def.get('MAX_SEQ_LENGTH', MAX_SEQ_LENGTH)
-        ROPE_HEAD_DIM = model_def.get('ROPE_HEAD_DIM', ROPE_HEAD_DIM)
-        COMPRESSED_HEAD_DIM = model_def.get('COMPRESSED_HEAD_DIM', HEAD_DIM - ROPE_HEAD_DIM)
-        KV_LATENT_DIM = model_def.get('KV_LATENT_DIM', MLA_LATENT_DIM)
-        Q_LATENT_DIM = model_def.get('Q_LATENT_DIM', MLA_LATENT_DIM)
-
-    except Exception as e:
-        training_console.print(Colors.error(f"❌ Failed to load model definition from {model_def_path}: {e}"))
-        training_console.print(Colors.warning(f"Using default model parameters instead"))
-
-    try:
-        training_console.update_progress_task("application", advance=1, description="Training Configs")
-        with open(train_def_path, 'r') as f:
-            train_def = json.load(f)
-        training_console.print(Colors.success(f"✓ Successfully loaded training definition from {args.train_def}"))
-
-        # Update training parameters
-        DROPOUT = train_def.get('DROPOUT', DROPOUT)
-        BATCH_SIZE = train_def.get('BATCH_SIZE', BATCH_SIZE)
-        GRAD_STEPS = train_def.get('GRAD_STEPS', GRAD_STEPS)
-        LEARNING_RATE = train_def.get('LEARNING_RATE', LEARNING_RATE)
-        TOK_PER_PARAM = train_def.get('TOK_PER_PARAM', TOK_PER_PARAM)
-        WEIGHT_DECAY = train_def.get('WEIGHT_DECAY', WEIGHT_DECAY)
-    except Exception as e:
-        training_console.print(Colors.error(f"❌ Failed to load training definition from {train_def_path}: {e}"))
-        training_console.print(Colors.warning(f"Using default model parameters instead"))
 
     def display_frame_info(frame_info: FrameSummary):
         training_console.print(Colors.info(f"  File: {Colors.highlight(frame_info.filename)}"))
@@ -568,7 +497,7 @@ def run_training(args):
 
     def display_exception(exception: Exception, msg: str = "❌ Training failed with error"):
         training_console.progress_stop()
-        if args.use_live_display:
+        if cfg.use_live_display:
             training_console.print(Colors.error(f"\n{msg}: {exception}"))
             tb = exception.__traceback__
             if tb:
@@ -593,23 +522,22 @@ def run_training(args):
             training_console.handle_exception()
 
     # Handle cache directory
-    if args.clear_cache and os.path.exists(args.cache_dir):
-        training_console.print(Colors.warning(f"Clearing cache directory: {args.cache_dir}"))
-        for file in os.listdir(args.cache_dir):
+    if cfg.dataset.clear_cache and os.path.exists(cfg.dataset.cache_dir):
+        training_console.print(Colors.warning(f"Clearing cache directory: {cfg.dataset.cache_dir}"))
+        for file in os.listdir(cfg.dataset.cache_dir):
             if file.endswith(".pkl"):
-                os.remove(os.path.join(args.cache_dir, file))
+                os.remove(os.path.join(cfg.dataset.cache_dir, file))
 
     training_console.update_progress_task("application", advance=1, description="Init Tokenizer")
     try:
-        tokenizer = tiktoken.get_encoding("cl100k_base")  # Using the ChatGPT/GPT-4 encoding
-        # For compatibility with HF interface
-        tokenizer.vocab_size = tokenizer.max_token_value + 256  # Add special tokens count
-        tokenizer.eos_token_id = 100257  # Default in tiktoken
+        tokenizer = tiktoken.get_encoding("cl100k_base")
+        tokenizer.vocab_size = tokenizer.max_token_value + 1
+        tokenizer.eos_token_id = 100257
         tokenizer.pad_token_id = tokenizer.eos_token_id
     except:
         print("Falling back to GPT-2 tokenizer")
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token
         tokenizer.vocab_size = 50257
 
     # Initialize variables
@@ -618,23 +546,23 @@ def run_training(args):
 
     training_console.update_progress_task("application", advance=1, description="Loading Dataset")
     try:
-        if args.no_cache:
+        if cfg.dataset.no_cache:
             train_dataset = HFDataset(
                 tokenizer=tokenizer,
-                dataset_path=args.dataset,
-                dataset_name=args.dataset_name,
-                seq_length=MAX_SEQ_LENGTH,
+                dataset_path=cfg.dataset.name,
+                dataset_name=cfg.dataset.subset,
+                seq_length=cfg.dataset.seq_length,
                 split="train"
             )
 
             test_dataset = HFDataset(
                 tokenizer=tokenizer,
-                dataset_path=args.dataset,
-                dataset_name=args.dataset_name,
-                seq_length=MAX_SEQ_LENGTH,
+                dataset_path=cfg.dataset.name,
+                dataset_name=cfg.dataset.subset,
+                seq_length=cfg.dataset.seq_length,
                 split="test"
             )
-        elif args.stream_dataset:
+        elif cfg.dataset.stream_dataset:
             def tokenize_example(batch: Dict[str, list]) -> Dict[str, list]:
                 encoded_texts = tokenizer.encode_batch(batch["text"])
                 return {
@@ -642,12 +570,12 @@ def run_training(args):
                 }
 
             core_dataset = load_dataset(
-                path=args.dataset,
-                name=args.dataset_name,
+                path=cfg.dataset.name,
+                name=cfg.dataset.subset,
                 split="train",
                 streaming=True,
                 trust_remote_code=True,
-                cache_dir=args.cache_dir
+                cache_dir=cfg.dataset.cache_dir
             )
             core_dataset = core_dataset.map(tokenize_example, batched=True)
             core_dataset = core_dataset.shuffle(seed=1240, buffer_size=10000)
@@ -658,20 +586,20 @@ def run_training(args):
             # Use the cached dataset implementation
             train_dataset = CachedHFDataset(
                 tokenizer=tokenizer,
-                dataset_path=args.dataset,
-                dataset_name=args.dataset_name,
-                seq_length=MAX_SEQ_LENGTH,
+                dataset_path=cfg.dataset.name,
+                dataset_name=cfg.dataset.subset,
+                seq_length=cfg.dataset.seq_length,
                 split="train",
-                cache_dir=args.cache_dir
+                cache_dir=cfg.dataset.cache_dir
             )
 
             test_dataset = CachedHFDataset(
                 tokenizer=tokenizer,
-                dataset_path=args.dataset,
-                dataset_name=args.dataset_name,
-                seq_length=MAX_SEQ_LENGTH,
+                dataset_path=cfg.dataset.name,
+                dataset_name=cfg.dataset.subset,
+                seq_length=cfg.dataset.seq_length,
                 split="test",
-                cache_dir=args.cache_dir
+                cache_dir=cfg.dataset.cache_dir
             )
     except Exception as e:
         display_exception(exception=e, msg="💥 Error processing datasets")
@@ -748,8 +676,8 @@ def run_training(args):
             if len(ids) < 2:  # Need at least 2 tokens to create a pair
                 continue
 
-            if len(ids) > MAX_SEQ_LENGTH:
-                ids = ids[:MAX_SEQ_LENGTH]
+            if len(ids) > cfg.dataset.seq_length:
+                ids = ids[:cfg.dataset.seq_length]
 
             input_seq = ids[:-1]
             label_seq = ids[1:]
@@ -809,10 +737,10 @@ def run_training(args):
     try:
         if run_status == "setup":
             # Create data loaders
-            if args.stream_dataset:
+            if cfg.dataset.stream_dataset:
                 train_dataloader = DataLoader(
                     train_dataset,
-                    batch_size=BATCH_SIZE,
+                    batch_size=cfg.training.batch_size,
                     num_workers=1,
                     collate_fn=collate_fn_stream,
                     prefetch_factor=4
@@ -820,14 +748,14 @@ def run_training(args):
 
                 test_dataloader = DataLoader(
                     test_dataset,
-                    batch_size=BATCH_SIZE,
+                    batch_size=cfg.training.batch_size,
                     num_workers=0,
                     collate_fn=collate_fn_stream
                 )
             else:
                 train_dataloader = DataLoader(
                     train_dataset,
-                    batch_size=BATCH_SIZE,
+                    batch_size=cfg.training.batch_size,
                     shuffle=True,
                     num_workers=0,
                     collate_fn=collate_fn
@@ -835,7 +763,7 @@ def run_training(args):
 
                 test_dataloader = DataLoader(
                     test_dataset,
-                    batch_size=BATCH_SIZE,
+                    batch_size=cfg.training.batch_size,
                     shuffle=False,
                     num_workers=0,
                     collate_fn=collate_fn
@@ -872,30 +800,21 @@ def run_training(args):
             training_console.update_progress_task("application", advance=1, description="Model Initialization")
             # Create model instance
             vocab_size = tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else 50257
-            torch.set_float32_matmul_precision('high')
-            model = MLATransformer(
+            if cfg.float_32_precision is not None:
+                torch.set_float32_matmul_precision(cfg.float_32_precision)
+            model: MLATransformer|None = hydra.utils.instantiate(
+                cfg.model,
                 vocab_size=vocab_size,
-                hidden_dim=HIDDEN_DIM,
-                num_layers=NUM_LAYERS,
-                num_heads=NUM_HEADS,
-                ff_dim=FF_DIM,
-                kv_latent_dim=KV_LATENT_DIM,
-                q_latent_dim=Q_LATENT_DIM,
-                dropout=DROPOUT,
-                max_seq_len=MAX_SEQ_LENGTH,
-                rope_head_dim=ROPE_HEAD_DIM,
-                use_checkpointing=args.use_checkpointing,
-                use_fusion=args.use_fusions
             )
             model.to(device)
             # Compile with torch.compile() for better kernel fusion
-            if args.compile_model:
+            if cfg.training.compile_model:
                 torch._logging.set_logs(inductor=logging.ERROR)
                 training_console.print(Colors.info("Compiling model with torch.compile()"))
                 model = torch.compile(model, backend="inductor", mode="default")
                 training_console.print(Colors.success("Model compiled successfully"))
                 training_console.print(Colors.info("Model warmup with a single forward pass"))
-                dummy = torch.randint(0, vocab_size, (BATCH_SIZE, MAX_SEQ_LENGTH), device=device, dtype=torch.long)
+                dummy = torch.randint(0, vocab_size, (cfg.training.batch_size, cfg.dataset.seq_length), device=device, dtype=torch.long)
                 _ = model(dummy)
                 training_console.print(Colors.success("Model warmup complete"))
         else:
@@ -915,15 +834,15 @@ def run_training(args):
             param_size_mb = total_params * 4 / (1024 ** 2)
 
             training_console.print(Colors.info(f"  • Architecture: Multi-head Latent Attention Transformer"))
-            training_console.print(Colors.info(f"  • Model definition: {Colors.highlight(args.model_def)}"))
-            training_console.print(Colors.info(f"  • Hidden dimension: {Colors.highlight(str(HIDDEN_DIM))}"))
-            training_console.print(Colors.info(f"  • Attention heads: {Colors.highlight(str(NUM_HEADS))}"))
-            training_console.print(Colors.info(f"  • Layers: {Colors.highlight(str(NUM_LAYERS))}"))
-            training_console.print(Colors.info(f"  • Head dimension: {Colors.highlight(str(HEAD_DIM))}"))
-            training_console.print(Colors.info(f"  • RoPE head dimension: {Colors.highlight(str(ROPE_HEAD_DIM))}"))
-            training_console.print(Colors.info(f"  • Compressed head dimension: {Colors.highlight(str(COMPRESSED_HEAD_DIM))}"))
-            training_console.print(Colors.info(f"  • Latent dimension: {Colors.highlight(str(MLA_LATENT_DIM))}"))
-            training_console.print(Colors.info(f"  • Feed-forward dimension: {Colors.highlight(str(FF_DIM))}"))
+            training_console.print(Colors.info(f"  • Hidden dimension: {Colors.highlight(cfg.model.hidden_dim)}"))
+            training_console.print(Colors.info(f"  • Attention heads: {Colors.highlight(cfg.model.num_heads)}"))
+            training_console.print(Colors.info(f"  • Layers: {Colors.highlight(cfg.model.num_layers)}"))
+            training_console.print(Colors.info(f"  • Head dimension: {Colors.highlight(cfg.model.hidden_dim // cfg.model.num_heads)}"))
+            training_console.print(Colors.info(f"  • RoPE head dimension: {Colors.highlight(cfg.model.rope_head_dim)}"))
+            training_console.print(Colors.info(f"  • Compressed head dimension: {Colors.highlight((cfg.model.hidden_dim // cfg.model.num_heads) - cfg.model.rope_head_dim)}"))
+            training_console.print(Colors.info(f"  • Key/Value Latent dimension: {Colors.highlight(cfg.model.kv_latent_dim)}"))
+            training_console.print(Colors.info(f"  • Query Latent dimension: {Colors.highlight(cfg.model.q_latent_dim)}"))
+            training_console.print(Colors.info(f"  • Feed-forward dimension: {Colors.highlight(cfg.model.ff_dim)}"))
             training_console.print(Colors.info(f"  • Parameters: {Colors.highlight(f'{total_params:,}')}"))
             training_console.print(Colors.info(f"  • Model size: {Colors.highlight(f'{param_size_mb:.2f} MB')}"))
 
@@ -934,7 +853,7 @@ def run_training(args):
             optimizer_grouped_parameters = [
                 {
                     "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                    "weight_decay": WEIGHT_DECAY,
+                    "weight_decay": cfg.training.weight_decay,
                 },
                 {
                     "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
@@ -949,7 +868,10 @@ def run_training(args):
             # print(Colors.success(f"✓ Using 8-bit Adam optimizer for memory efficiency"))
             # except ImportError:
             # Fall back to regular AdamW
-            optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=LEARNING_RATE, betas=(0.9, 0.95))
+            optimizer: torch.optim.AdamW|None = hydra.utils.instantiate(
+                cfg.training.optimizer,
+                params=optimizer_grouped_parameters,
+            )
             training_console.print(Colors.warning(f"  ⚠️ Using regular AdamW optimizer (8-bit not available)"))
         else:
             training_console.print(Colors.warning(f"  🚫 Optimizer configuration skipped due to previous error"))
@@ -963,16 +885,16 @@ def run_training(args):
 
     if run_status == "setup":
         # Learning rate scheduler
-        target_tokens = total_params * TOK_PER_PARAM
+        target_tokens = total_params * cfg.training.target_tokens_per_param
         eval_interval = 100
 
         # Print training configuration
-        training_console.print(Colors.info(f"  • Dataset: {Colors.highlight(f'{args.dataset}/{args.dataset_name}')}"))
-        training_console.print(Colors.info(f"  • Sequence Length: {Colors.highlight(str(MAX_SEQ_LENGTH))}"))
-        training_console.print(Colors.info(f"  • Batch Size: {Colors.highlight(str(BATCH_SIZE))} (effective: {Colors.highlight(str(BATCH_SIZE * GRAD_STEPS))})"))
-        training_console.print(Colors.info(f"  • Learning Rate: {Colors.highlight(str(LEARNING_RATE))}"))
-        training_console.print(Colors.info(f"  • Using Cache: {Colors.highlight('No' if args.no_cache else 'Yes')}"))
-        training_console.print(Colors.info(f"  • Gradient accumulation steps: {Colors.highlight(str(GRAD_STEPS))}"))
+        training_console.print(Colors.info(f"  • Dataset: {Colors.highlight(f'{cfg.dataset.name}/{cfg.dataset.subset}')}"))
+        training_console.print(Colors.info(f"  • Sequence Length: {Colors.highlight(cfg.dataset.seq_length)}"))
+        training_console.print(Colors.info(f"  • Batch Size: {Colors.highlight(cfg.training.batch_size)} (effective: {Colors.highlight(cfg.training.batch_size * cfg.training.grad_steps)})"))
+        training_console.print(Colors.info(f"  • Learning Rate: {Colors.highlight(cfg.training.learning_rate)}"))
+        training_console.print(Colors.info(f"  • Using Cache: {Colors.highlight('No' if cfg.dataset.no_cache else 'Yes')}"))
+        training_console.print(Colors.info(f"  • Gradient accumulation steps: {Colors.highlight(cfg.training.grad_steps)}"))
         training_console.print(Colors.info(f"  • Target training tokens: {Colors.highlight(f'{target_tokens:,}')}"))
 
     else:
@@ -983,58 +905,49 @@ def run_training(args):
         if run_status == "setup":
             training_console.update_progress_task("application", advance=1, description="Create Scheduler")
             # Create scheduler
-            scheduler = TokenBasedCosineLRScheduler(
+            scheduler: TokenBasedCosineLRScheduler|None = hydra.utils.instantiate(
+                cfg.training.scheduler,
                 optimizer=optimizer,
                 target_total_tokens=target_tokens,
-                max_lr=LEARNING_RATE,
-                warmup_ratio=0.08
             )
 
             training_console.update_progress_task("application", advance=1, description="W&B Initialization")
             # Initialize wandb (optional)
-            wandb_log_path = os.path.abspath("~/wandb/logs")
-            os.makedirs(wandb_log_path, exist_ok=True)
-            os.environ["WANDB_SILENT"] = "true"
-            os.environ["WANDB_CONSOLE"] = "off"
-            logging.getLogger("wandb").setLevel(logging.ERROR)
-            wandb_settings = wandb.Settings(console="off", silent=True, program_relpath="train.py")
-            wandb.init(
-                dir=wandb_log_path,
-                project="TabulaPrima",
-                entity="jordan-ledoux-none",
-                job_type="training",
-                tags=["experiment", "generic-dataset", "pretraining"],
-                config={
-                    "job_name": args.run_name + "-" + datetime.datetime.now().strftime("%b%d"),
-                    "model_def": {
-                        "parameters": total_params,
-                        "seq_length": MAX_SEQ_LENGTH,
-                        "hidden_dim": HIDDEN_DIM,
-                        "num_heads": NUM_HEADS,
-                        "num_layers": NUM_LAYERS,
-                        "head_dim": HEAD_DIM,
-                        "ff_dim": FF_DIM,
-                        "latent_dim": MLA_LATENT_DIM,
-                        "rope_head_dim": ROPE_HEAD_DIM,
-                        "compressed_head_dim": COMPRESSED_HEAD_DIM,
-                        "kv_latent_dim": KV_LATENT_DIM,
-                        "q_latent_dim": Q_LATENT_DIM,
-                        "source": model_def if model_def else "default values"
-                    },
-                    "training_def": {
-                        "batch_size": BATCH_SIZE,
-                        "learning_rate": LEARNING_RATE,
-                        "gradient_accumulation_steps": GRAD_STEPS,
-                        "optimizer": "Adam8Bit" if "8bit" in optimizer.__class__.__name__ else "AdamW",
-                        "dropout": DROPOUT,
-                        "grad_checkpoints": args.use_checkpointing,
-                        "allow_amp_switch": args.allow_amp_switchover,
-                        "target_tokens": target_tokens,
-                    },
-                },
-                name=args.run_name + "-" + datetime.datetime.now().strftime("%b%d").upper(),
-                settings=wandb_settings
-            )
+            if cfg.training.wandb.log:
+                run_name = f"{cfg.training.wandb.run_name}-{time.strftime('%b%d').upper()}"
+
+                wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+                # Add runtime info not in static config
+                wandb_config['model']['parameters'] = total_params
+                wandb_config['training']['target_tokens'] = target_tokens
+                wandb_config['training']['effective_batch_size'] = cfg.training.batch_size * cfg.training.grad_steps
+
+                if cfg.training.wandb.silent:
+                    os.environ["WANDB_SILENT"] = "true"
+                    os.environ["WANDB_CONSOLE"] = "off"
+                    logging.getLogger("wandb").setLevel(logging.ERROR)
+                    wandb_settings = wandb.Settings(console="off", silent=True, program_relpath="train.py")
+                    wandb.init(
+                        project=cfg.training.wandb.project,
+                        entity=cfg.training.wandb.entity,
+                        job_type="training",
+                        config=wandb_config,
+                        name=run_name,
+                        tags=cfg.training.wandb.tags,
+                        dir=".",
+                        settings=wandb_settings
+                    )
+                else:
+                    wandb.init(
+                        project=cfg.training.wandb.project,
+                        entity=cfg.training.wandb.entity,
+                        job_type="training",
+                        config=wandb_config,
+                        name=run_name,
+                        tags=cfg.training.wandb.tags,
+                        dir="."
+                    )
+                training_console.print(Colors.success("W&B Initialized."))
         else:
             training_console.print(Colors.warning(f"  🚫 Scheduler configuration skipped due to previous error"))
             scheduler = None
@@ -1056,17 +969,10 @@ def run_training(args):
                 optimizer=optimizer,
                 scheduler=scheduler,
                 device=device,
-                total_parameters=total_params,
-                gradient_accumulation_steps=GRAD_STEPS,
-                checkpoint_dir="checkpoints",
-                use_amp=args.use_amp,
-                eval_interval=eval_interval,
                 wandb=wandb,
-                allow_amp_switch=args.allow_amp_switchover,
-                console=training_console,
+                cfg=cfg.training,
             )
-            run_status = "training"
-            trained_tokens, run_status = trainer.run()
+            trained_tokens, run_status = trainer.run_tokens(target_tokens)
             if run_status == "failed":
                 wandb.run.status = run_status
         else:

@@ -1,0 +1,20 @@
+# Default selections for different configuration groups
+defaults:
+  - model: 255m_params
+  - training: default
+  - dataset: wikitext
+  - tokenizer: tiktoken
+  - _self_
+
+# Parameters that don't fit neatly into other groups (like args in train.py)
+use_live_display: false
+use_stats: false
+float_32_precision: highest
+
+# Define where Hydra should store outputs (logs, saved configs, checkpoints if not overridden)
+# Hydra automatically creates dated/timed subdirectories here
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

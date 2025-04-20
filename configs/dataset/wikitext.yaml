@@ -1,0 +1,9 @@
+# @package _group_
+name: wikitext
+subset: wikitext-103-raw-v1
+dataset_type: hf
+stream_dataset: false
+cache_dir: "dataset_cache"
+no_cache: false
+clear_cache: false
+seq_length: 512

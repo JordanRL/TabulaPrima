@@ -1,0 +1,7 @@
+defaults:
+  - tiktoken_schema
+
+name: tiktoken
+encoding_name: cl100k_base
+eos_token_id: 100257
+padding_token_id: 100257

@@ -1,0 +1,26 @@
+# Define which optimizer/scheduler configs to use by default
+defaults:
+  - optimizer: adamw        # Corresponds to configs/optimizer/adamw.yaml
+  - scheduler: cosine_token # Corresponds to configs/scheduler/cosine_token.yaml
+  - wandb: default
+  - _self_                # Include parameters defined directly below
+
+# @package _group_
+batch_size: 1
+grad_steps: 16
+dropout: 0.0
+learning_rate: 5e-5
+weight_decay: 0.01
+max_grad_norm: 1.0
+log_interval: 10
+eval_interval: 100
+use_amp: false
+allow_amp_switchover: false
+use_checkpointing: false
+use_fusions: false
+compile_model: true
+target_tokens_per_param: 10
+
+# Checkpointing/Output settings
+checkpoint_dir: "checkpoints"
+model_dir: "models"

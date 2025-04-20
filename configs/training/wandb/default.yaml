@@ -1,0 +1,6 @@
+run_name: "WikiText"
+silent: true
+project: "TabulaPrima"
+entity: "jordan-ledoux-none"
+tags: ["experiment", "generic-dataset", "pretraining"]
+log: true
