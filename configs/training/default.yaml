@@ -3,6 +3,7 @@ defaults:
   - optimizer: adamw        # Corresponds to configs/optimizer/adamw.yaml
   - scheduler: cosine_token # Corresponds to configs/scheduler/cosine_token.yaml
   - wandb: default
+  - training_schema
   - _self_                # Include parameters defined directly below
 
 # @package _group_

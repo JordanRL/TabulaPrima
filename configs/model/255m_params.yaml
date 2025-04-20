@@ -1,3 +1,6 @@
+defaults:
+  - model_schema
+
 # @package _group_
 _target_: model_arch.MLATransformer
 
@@ -12,4 +15,4 @@ dropout: ${training.dropout}
 max_seq_len: ${dataset.seq_length}
 rope_head_dim: 32
 use_checkpointing: ${training.use_checkpointing}
-use_fusion: ${training.use_fusions}
+use_fusions: ${training.use_fusions}

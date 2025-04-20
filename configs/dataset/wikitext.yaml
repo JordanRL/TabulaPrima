@@ -1,3 +1,6 @@
+defaults:
+  - dataset_schema
+
 # @package _group_
 name: wikitext
 subset: wikitext-103-raw-v1

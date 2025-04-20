@@ -4,6 +4,7 @@ defaults:
   - training: default
   - dataset: wikitext
   - tokenizer: tiktoken
+  - config_schema
   - _self_
 
 # Parameters that don't fit neatly into other groups (like args in train.py)
