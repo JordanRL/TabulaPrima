@@ -391,7 +391,7 @@ class TPConsole:
         if self._use_live:
             message_line_count = self._console.size.height
             if self._layout['progress'].visible:
-                message_line_count -= 6 # Progress/Stats panel
+                message_line_count -= 7 # Progress/Stats panel
             message_line_count -= 3  # Title bar
             message_line_count -= 3  # Top and bottom padding
             displayed_messages = self._messages[-message_line_count:]
