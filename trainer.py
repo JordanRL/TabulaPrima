@@ -313,6 +313,9 @@ class Trainer:
         self.training_state.time_of_last_instrument = self.start_time
         self.last_checkpoint_time = self.start_time
 
+        last_cli_update_time = time.time()
+        last_cli_update_tokens = 0
+
         while self.training_state.tokens_seen < self.training_state.target_tokens:
             for batch in self.train_dataloader:
                 batch_result = self._process_batch(
@@ -321,6 +324,22 @@ class Trainer:
 
                 if not batch_result:
                     return self.training_state.tokens_seen, "failed"
+
+                cli_interval = time.time() - last_cli_update_time
+                if cli_interval > 1800:
+                    last_cli_update_time = time.time()
+                    self.console.rule("Periodic Training Update Summary")
+                    tokens_seen = self.training_state.tokens_seen - last_cli_update_tokens
+                    last_cli_update_tokens = self.training_state.tokens_seen
+                    summary = [
+                        {"title": "Total Tokens Seen", "content": f"{tokens_seen:,}"},
+                        {"title": "Current Loss", "content": f"{self.training_state.current_loss:.2f}"},
+                        {"title": "Current Perplexity", "content": f"{self.training_state.current_perplexity:.2f}"},
+                        {"title": "Avg Tokens/Sec", "content": f"{tokens_seen/cli_interval:.2f}"},
+                        {"title": "Run Phase", "content": self.training_state.run_phase.title()},
+                        {"title": "Precision Mode", "content": self.training_state.get_current_precision_mode()},
+                    ]
+                    self.console.print_list(summary)
 
                 if self.training_state.tokens_seen >= self.training_state.target_tokens:
                     break
@@ -592,7 +611,7 @@ class Trainer:
         self.training_state.update_metrics(actual_tokens_in_batch, loss.item() * self.cfg.grad_steps, self.cfg.batch_size)
 
         self.console.update_app_stats({
-            "Tokens/s": f"{self.training_state.tokens_per_sec:.2f}",
+            "Tokens/s": f"{self.training_state.tokens_per_sec:08,.2f}",
             "Loss": f"{self.training_state.current_loss:.4f}",
             "Perplexity": f"{self.training_state.current_perplexity:,.2f}",
             "Grad Norm": f"{sum(self.training_state.grad_norm_history[-self.cfg.grad_steps:]) / self.cfg.grad_steps:.4f}",
@@ -626,8 +645,8 @@ class Trainer:
 
                 self.console.update_app_stats({
                     "Last Eval Loss": f"{test_loss:.4f}",
-                    "Last Eval Perplexity": f"{test_perplexity:,.4f}",
-                    "Last Eval Accuracy": f"{test_accuracy:.4f}",
+                    "Last Eval Perplexity": f"{test_perplexity:,.2f}",
+                    "Last Eval Accuracy": f"{test_accuracy*100:.2f}%",
                 })
 
                 self.model.train()
