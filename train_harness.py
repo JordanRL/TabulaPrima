@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, List
 import hydra.utils
 import tiktoken
 import torch
+from hydra.utils import to_absolute_path
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
 from torch.utils.data import Dataset, DataLoader
@@ -127,12 +128,12 @@ class HFDataset(Dataset):
         self.total_tokens = total_tokens
 
         # Print summary information
-        print(Colors.success(f"✓ Loaded {split} dataset:"))
-        print(Colors.info(f"  • Dataset: {dataset_path}/{dataset_name or ''}"))
-        print(Colors.info(f"  • Text items processed: {text_items} (skipped {skipped_short} short items)"))
-        print(Colors.info(f"  • Training examples: {Colors.highlight(f'{len(self.examples):,}')}"))
-        print(Colors.info(f"  • Total tokens: {Colors.highlight(f'{total_tokens:,}')}"))
-        print(Colors.info(f"  • Avg tokens per example: {total_tokens / max(1, len(self.examples)):.1f}"))
+        print(Colors.success(f"» Loaded {split} dataset:"))
+        print(Colors.info(f"» Dataset: {dataset_path}/{dataset_name or ''}"))
+        print(Colors.info(f"» Text items processed: {text_items} (skipped {skipped_short} short items)"))
+        print(Colors.info(f"» Training examples: {Colors.highlight(f'{len(self.examples):,}')}"))
+        print(Colors.info(f"» Total tokens: {Colors.highlight(f'{total_tokens:,}')}"))
+        print(Colors.info(f"» Avg tokens per example: {total_tokens / max(1, len(self.examples)):.1f}"))
 
     def __len__(self):
         return len(self.examples)
@@ -173,7 +174,7 @@ class CachedHFDataset(Dataset):
         self.tokenizer = tokenizer
         self.seq_length = seq_length
         self.split = split
-        self.cache_dir = cache_dir
+        self.cache_dir = hydra.utils.to_absolute_path(cache_dir)
         self.console = TPConsole()
         self.total_raw_tokens = 0
         self.total_tokens = 0
@@ -188,7 +189,7 @@ class CachedHFDataset(Dataset):
             self.vocab_size = tokenizer.vocab_size
         cache_key = f"{tokenizer_name}_{self.vocab_size}_{dataset_path}_{dataset_name or ''}_{split}_{seq_length}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
-        self.cache_file = os.path.join(cache_dir, f"{cache_hash}.pkl")
+        self.cache_file = os.path.join(self.cache_dir, f"{cache_hash}.pkl")
 
         self.console.rule(Colors.highlight(f"Dataset: {dataset_path}/{dataset_name or ''} ({split})"),
                           style=Colors.HEADER)
@@ -266,21 +267,19 @@ class CachedHFDataset(Dataset):
             self._save_to_cache()
 
         # Print summary information
-        self.console.print(f"  ✓ Loaded {split} dataset:")
-        self.console.print(f"  • Dataset: {dataset_path}/{dataset_name or ''}")
-        self.console.print(f"  • Split: {split}")
-        self.console.print(f"  • Examples: {len(self.examples):,}")
-        if hasattr(self, 'total_tokens'):
-            self.console.print(f"  • Total tokens: {self.total_tokens:,}")
+        summary = [
+            {"title": "Dataset", "content": dataset_path+"/"+dataset_name},
+            {"title": "Split", "content": split},
+            {"title": "Examples", "content": f"{len(self.examples):,}"},
+            {"title": "Sequence length", "content": seq_length}
+        ]
+        if hasattr(self, "total_tokens"):
+            summary.append({"title": "Total raw tokens", "content": f"{self.total_tokens:,}"})
         if hasattr(self, 'effective_total_tokens'):
-            self.console.print(f"  • Effective total tokens: {self.effective_total_tokens:,}")
-            self.console.print(
-                f"  • Avg tokens per example: {self.effective_total_tokens / max(1, len(self.examples)):.1f}")
-        self.console.print(f"  • Sequence length: {seq_length}")
-        if was_cached:
-            self.console.print(f"  • Loaded from cache: Yes ✓")
-        else:
-            self.console.print(f"  • Saved to cache: Yes ✓")
+            summary.append({"title": "Total effective tokens", "content": f"{self.effective_total_tokens:,}"})
+            summary.append({"title": "Avg tokens per example", "content": f"{self.effective_total_tokens / max(1, len(self.examples)):.2f}"})
+
+        self.console.print_list(summary)
 
     def _load_from_cache(self):
         """Try to load the dataset from cache file"""
@@ -290,14 +289,14 @@ class CachedHFDataset(Dataset):
 
         if os.path.exists(self.cache_file):
             try:
-                self.console.print(f"Loading cached dataset from {self.cache_file}...")
+                self.console.print_notification(f"Loading cached dataset from {Colors.header(self.cache_file)}")
                 with open(self.cache_file, 'rb') as f:
                     cache_data = pickle.load(f)
                     self.total_tokens = cache_data['total_tokens']
                     self.effective_total_tokens = cache_data['effective_total_tokens']
                     return cache_data['examples']
             except Exception as e:
-                self.console.print(f"Error loading cache: {e}")
+                self.console.print_error(f"Error loading cache: {e}")
                 return None
         return None
 
@@ -306,7 +305,7 @@ class CachedHFDataset(Dataset):
         if not os.path.exists(self.cache_dir):
             os.makedirs(self.cache_dir, exist_ok=True)
 
-        self.console.print(f"Saving dataset to cache at {self.cache_file}...")
+        self.console.print_notification(f"Saving dataset to cache at {Colors.header(self.cache_file)}")
         with open(self.cache_file, 'wb') as f:
             cache_data = {
                 'examples': self.examples,
@@ -488,6 +487,13 @@ class TokenBasedCosineLRScheduler:
 def run_training(cfg: Config):
     training_console = TPConsole()
 
+    if not os.path.exists(cfg.training.checkpoint_dir):
+        os.makedirs(cfg.training.checkpoint_dir, exist_ok=True)
+    if not os.path.exists('models'):
+        os.makedirs('models', exist_ok=True)
+
+    training_console.section("Datasets and Hardware")
+
     def display_frame_info(frame_info: FrameSummary):
         training_console.print(Colors.info(f"  File: {Colors.highlight(frame_info.filename)}"))
         training_console.print(Colors.info(f"  Line: {Colors.highlight(frame_info.lineno)}"))
@@ -522,11 +528,11 @@ def run_training(cfg: Config):
             training_console.handle_exception()
 
     # Handle cache directory
-    if cfg.dataset.clear_cache and os.path.exists(cfg.dataset.cache_dir):
-        training_console.print(Colors.warning(f"Clearing cache directory: {cfg.dataset.cache_dir}"))
-        for file in os.listdir(cfg.dataset.cache_dir):
+    if cfg.dataset.clear_cache and os.path.exists(to_absolute_path(cfg.dataset.cache_dir)):
+        training_console.print_warning(f"Clearing cache directory: {cfg.dataset.cache_dir}")
+        for file in os.listdir(to_absolute_path(cfg.dataset.cache_dir)):
             if file.endswith(".pkl"):
-                os.remove(os.path.join(cfg.dataset.cache_dir, file))
+                os.remove(os.path.join(to_absolute_path(cfg.dataset.cache_dir), file))
 
     training_console.update_progress_task("application", advance=1, description="Init Tokenizer")
     try:
@@ -535,7 +541,7 @@ def run_training(cfg: Config):
         tokenizer.eos_token_id = 100257
         tokenizer.pad_token_id = tokenizer.eos_token_id
     except:
-        print("Falling back to GPT-2 tokenizer")
+        training_console.print("Falling back to GPT-2 tokenizer")
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         tokenizer.pad_token_id = tokenizer.eos_token
         tokenizer.vocab_size = 50257
@@ -568,7 +574,7 @@ def run_training(cfg: Config):
                 return {
                     "input_ids": encoded_texts
                 }
-
+            training_console.print_notification("Initializing streaming dataset")
             core_dataset = load_dataset(
                 path=cfg.dataset.name,
                 name=cfg.dataset.subset,
@@ -577,11 +583,14 @@ def run_training(cfg: Config):
                 trust_remote_code=True,
                 cache_dir=cfg.dataset.cache_dir
             )
+            training_console.print_complete("Streaming dataset initialized")
             core_dataset = core_dataset.map(tokenize_example, batched=True)
             core_dataset = core_dataset.shuffle(seed=1240, buffer_size=10000)
 
+            training_console.print_notification("Splitting streaming dataset into train and test sets")
             test_dataset = core_dataset.take(1000)
             train_dataset = core_dataset.skip(1000)
+            training_console.print_complete("Split finished, dataset ready to train")
         else:
             # Use the cached dataset implementation
             train_dataset = CachedHFDataset(
@@ -741,7 +750,7 @@ def run_training(cfg: Config):
                 train_dataloader = DataLoader(
                     train_dataset,
                     batch_size=cfg.training.batch_size,
-                    num_workers=1,
+                    num_workers=cfg.dataset.num_workers,
                     collate_fn=collate_fn_stream,
                     prefetch_factor=4
                 )
@@ -749,7 +758,7 @@ def run_training(cfg: Config):
                 test_dataloader = DataLoader(
                     test_dataset,
                     batch_size=cfg.training.batch_size,
-                    num_workers=0,
+                    num_workers=2,
                     collate_fn=collate_fn_stream
                 )
             else:
@@ -757,7 +766,7 @@ def run_training(cfg: Config):
                     train_dataset,
                     batch_size=cfg.training.batch_size,
                     shuffle=True,
-                    num_workers=0,
+                    num_workers=cfg.dataset.num_workers,
                     collate_fn=collate_fn
                 )
 
@@ -765,11 +774,11 @@ def run_training(cfg: Config):
                     test_dataset,
                     batch_size=cfg.training.batch_size,
                     shuffle=False,
-                    num_workers=0,
+                    num_workers=2,
                     collate_fn=collate_fn
                 )
         else:
-            training_console.print(Colors.warning(f"  🚫 Data loaders skipped due to previous error"))
+            training_console.print(Colors.warning(f"🚫 Data loaders skipped due to previous error"))
             train_dataloader = None
             test_dataloader = None
     except Exception as e:
@@ -790,12 +799,12 @@ def run_training(cfg: Config):
             if torch.cuda.is_available():
                 gpu_name = torch.cuda.get_device_name(0)
                 total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-                training_console.print(Colors.success(f"  ✓ GPU detected: {Colors.highlight(gpu_name)}"))
-                training_console.print(Colors.info(f"  • Total VRAM: {Colors.highlight(f'{total_vram:.2f} GB')}"))
+                training_console.print(Colors.success(f"» GPU detected: {Colors.highlight(gpu_name)}"))
+                training_console.print(Colors.info(f"» Total VRAM: {Colors.highlight(f'{total_vram:.2f} GB')}"))
             else:
-                training_console.print(Colors.warning("  ⚠ No GPU detected! Training will be very slow on CPU."))
+                training_console.print(Colors.warning("⚠ No GPU detected! Training will be very slow on CPU."))
 
-            training_console.rule(Colors.highlight("Model Configuration"), style=Colors.HEADER)
+            training_console.section("Model Configuration")
 
             training_console.update_progress_task("application", advance=1, description="Model Initialization")
             # Create model instance
@@ -809,16 +818,17 @@ def run_training(cfg: Config):
             model.to(device)
             # Compile with torch.compile() for better kernel fusion
             if cfg.training.compile_model:
+                training_console.rule(Colors.highlight("Model Compilation"), style=Colors.HEADER)
                 torch._logging.set_logs(inductor=logging.ERROR)
-                training_console.print(Colors.info("Compiling model with torch.compile()"))
+                training_console.print_notification("Compiling model with torch.compile()")
                 model = torch.compile(model, backend="inductor", mode="default")
-                training_console.print(Colors.success("Model compiled successfully"))
-                training_console.print(Colors.info("Model warmup with a single forward pass"))
+                training_console.print_complete("Model compiled successfully")
+                training_console.print_notification("Model warmup with a single forward pass")
                 dummy = torch.randint(0, vocab_size, (cfg.training.batch_size, cfg.dataset.seq_length), device=device, dtype=torch.long)
                 _ = model(dummy)
-                training_console.print(Colors.success("Model warmup complete"))
+                training_console.print_complete("Model warmup complete")
         else:
-            training_console.print(Colors.warning(f"  🚫 Model configuration skipped due to previous error"))
+            training_console.print(Colors.warning(f"🚫 Model configuration skipped due to previous error"))
             model = None
             device = None
     except Exception as e:
@@ -833,20 +843,22 @@ def run_training(cfg: Config):
             total_params = sum(p.numel() for p in model.parameters())
             param_size_mb = total_params * 4 / (1024 ** 2)
 
-            training_console.print(Colors.info(f"  • Architecture: Multi-head Latent Attention Transformer"))
-            training_console.print(Colors.info(f"  • Hidden dimension: {Colors.highlight(cfg.model.hidden_dim)}"))
-            training_console.print(Colors.info(f"  • Attention heads: {Colors.highlight(cfg.model.num_heads)}"))
-            training_console.print(Colors.info(f"  • Layers: {Colors.highlight(cfg.model.num_layers)}"))
-            training_console.print(Colors.info(f"  • Head dimension: {Colors.highlight(cfg.model.hidden_dim // cfg.model.num_heads)}"))
-            training_console.print(Colors.info(f"  • RoPE head dimension: {Colors.highlight(cfg.model.rope_head_dim)}"))
-            training_console.print(Colors.info(f"  • Compressed head dimension: {Colors.highlight((cfg.model.hidden_dim // cfg.model.num_heads) - cfg.model.rope_head_dim)}"))
-            training_console.print(Colors.info(f"  • Key/Value Latent dimension: {Colors.highlight(cfg.model.kv_latent_dim)}"))
-            training_console.print(Colors.info(f"  • Query Latent dimension: {Colors.highlight(cfg.model.q_latent_dim)}"))
-            training_console.print(Colors.info(f"  • Feed-forward dimension: {Colors.highlight(cfg.model.ff_dim)}"))
-            training_console.print(Colors.info(f"  • Parameters: {Colors.highlight(f'{total_params:,}')}"))
-            training_console.print(Colors.info(f"  • Model size: {Colors.highlight(f'{param_size_mb:.2f} MB')}"))
+            training_console.rule(Colors.highlight("Model Settings Summary"), style=Colors.HEADER)
+            training_console.print(Colors.info(f"» Architecture: Multi-head Latent Attention Transformer"))
+            training_console.print(Colors.info(f"» Hidden dimension: {Colors.highlight(cfg.model.hidden_dim)}"))
+            training_console.print(Colors.info(f"» Attention heads: {Colors.highlight(cfg.model.num_heads)}"))
+            training_console.print(Colors.info(f"» Layers: {Colors.highlight(cfg.model.num_layers)}"))
+            training_console.print(Colors.info(f"» Head dimension: {Colors.highlight(cfg.model.hidden_dim // cfg.model.num_heads)}"))
+            training_console.print(Colors.info(f"» RoPE head dimension: {Colors.highlight(cfg.model.rope_head_dim)}"))
+            training_console.print(Colors.info(f"» Compressed head dimension: {Colors.highlight((cfg.model.hidden_dim // cfg.model.num_heads) - cfg.model.rope_head_dim)}"))
+            training_console.print(Colors.info(f"» Key/Value Latent dimension: {Colors.highlight(cfg.model.kv_latent_dim)}"))
+            training_console.print(Colors.info(f"» Query Latent dimension: {Colors.highlight(cfg.model.q_latent_dim)}"))
+            training_console.print(Colors.info(f"» Feed-forward dimension: {Colors.highlight(cfg.model.ff_dim)}"))
+            training_console.print(Colors.info(f"» Parameters: {Colors.highlight(f'{total_params:,}')}"))
+            training_console.print(Colors.info(f"» Model disk size: {Colors.highlight(f'{param_size_mb:.2f} MB')}"))
 
-            training_console.rule(Colors.highlight("Training Configuration"), style=Colors.HEADER)
+            training_console.section("Training Setup")
+            training_console.rule(Colors.highlight("Optimizer"), style=Colors.HEADER)
 
             training_console.update_progress_task("application", advance=1, description="Model Initialization")
             no_decay = ["bias", "LayerNorm.weight"]
@@ -860,21 +872,15 @@ def run_training(cfg: Config):
                     "weight_decay": 0.0,
                 },
             ]
-            # Initialize optimizer with weight decay and 8-bit precision
-            # try:
-            # Try to use 8-bit Adam if available (reduces optimizer memory by 75%)
-            # from bitsandbytes.optim import Adam8bit
-            # optimizer = Adam8bit(optimizer_grouped_parameters, lr=learning_rate, weight_decay=0.01)
-            # print(Colors.success(f"✓ Using 8-bit Adam optimizer for memory efficiency"))
-            # except ImportError:
-            # Fall back to regular AdamW
-            optimizer: torch.optim.AdamW|None = hydra.utils.instantiate(
-                cfg.training.optimizer,
-                params=optimizer_grouped_parameters,
+            optimizer = torch.optim.AdamW(
+                optimizer_grouped_parameters,
+                lr=cfg.training.learning_rate,
+                weight_decay=cfg.training.weight_decay,
+                betas=(0.9, 0.95)
             )
-            training_console.print(Colors.warning(f"  ⚠️ Using regular AdamW optimizer (8-bit not available)"))
+            training_console.print_notification("Using regular AdamW optimizer")
         else:
-            training_console.print(Colors.warning(f"  🚫 Optimizer configuration skipped due to previous error"))
+            training_console.print(Colors.warning(f"🚫 Optimizer configuration skipped due to previous error"))
             optimizer = None
             total_params = 0
     except Exception as e:
@@ -886,34 +892,27 @@ def run_training(cfg: Config):
     if run_status == "setup":
         # Learning rate scheduler
         target_tokens = total_params * cfg.training.target_tokens_per_param
-        eval_interval = 100
-
-        # Print training configuration
-        training_console.print(Colors.info(f"  • Dataset: {Colors.highlight(f'{cfg.dataset.name}/{cfg.dataset.subset}')}"))
-        training_console.print(Colors.info(f"  • Sequence Length: {Colors.highlight(cfg.dataset.seq_length)}"))
-        training_console.print(Colors.info(f"  • Batch Size: {Colors.highlight(cfg.training.batch_size)} (effective: {Colors.highlight(cfg.training.batch_size * cfg.training.grad_steps)})"))
-        training_console.print(Colors.info(f"  • Learning Rate: {Colors.highlight(cfg.training.learning_rate)}"))
-        training_console.print(Colors.info(f"  • Using Cache: {Colors.highlight('No' if cfg.dataset.no_cache else 'Yes')}"))
-        training_console.print(Colors.info(f"  • Gradient accumulation steps: {Colors.highlight(cfg.training.grad_steps)}"))
-        training_console.print(Colors.info(f"  • Target training tokens: {Colors.highlight(f'{target_tokens:,}')}"))
-
+        training_console.update_progress_task("application", advance=1, description="Create Scheduler")
+        training_console.rule(Colors.highlight("Learning Rate Scheduler"), style=Colors.HEADER)
+        # Create scheduler
+        scheduler: TokenBasedCosineLRScheduler|None = hydra.utils.instantiate(
+            cfg.training.scheduler,
+            optimizer=optimizer,
+            target_total_tokens=target_tokens,
+        )
+        training_console.print_notification("Using TokenBasedCosineLRScheduler")
     else:
+        training_console.print(Colors.warning(f"🚫 Scheduler configuration skipped due to previous error"))
+        scheduler = None
         target_tokens = 0
-        eval_interval = None
 
     try:
         if run_status == "setup":
-            training_console.update_progress_task("application", advance=1, description="Create Scheduler")
-            # Create scheduler
-            scheduler: TokenBasedCosineLRScheduler|None = hydra.utils.instantiate(
-                cfg.training.scheduler,
-                optimizer=optimizer,
-                target_total_tokens=target_tokens,
-            )
-
             training_console.update_progress_task("application", advance=1, description="W&B Initialization")
             # Initialize wandb (optional)
+            training_console.rule(Colors.highlight("Instrumentation"), style=Colors.HEADER)
             if cfg.training.wandb.log:
+
                 run_name = f"{cfg.training.wandb.run_name}-{time.strftime('%b%d').upper()}"
 
                 wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
@@ -947,14 +946,26 @@ def run_training(cfg: Config):
                         tags=cfg.training.wandb.tags,
                         dir="."
                     )
-                training_console.print(Colors.success("W&B Initialized."))
+                training_console.print_notification("W&B Initialized")
+            else:
+                training_console.print_warning("W&B disabled")
         else:
-            training_console.print(Colors.warning(f"  🚫 Scheduler configuration skipped due to previous error"))
+            training_console.print(Colors.warning(f"🚫 Scheduler configuration skipped due to previous error"))
             scheduler = None
     except Exception as e:
         display_exception(exception=e, msg="❌ Unable to create scheduler")
         run_status = "failed"
         scheduler = None
+
+    training_console.rule(Colors.highlight("Training Settings Summary"), style=Colors.HEADER)
+    # Print training configuration
+    training_console.print(Colors.info(f"» Dataset: {Colors.highlight(f'{cfg.dataset.name}/{cfg.dataset.subset}')}"))
+    training_console.print(Colors.info(f"» Sequence Length: {Colors.highlight(cfg.dataset.seq_length)}"))
+    training_console.print(Colors.info(f"» Batch Size: {Colors.highlight(cfg.training.batch_size)} (effective: {Colors.highlight(cfg.training.batch_size * cfg.training.grad_steps)})"))
+    training_console.print(Colors.info(f"» Learning Rate: {Colors.highlight(cfg.training.learning_rate)}"))
+    training_console.print(Colors.info(f"» Using Cache: {Colors.highlight('No' if cfg.dataset.no_cache else 'Yes')}"))
+    training_console.print(Colors.info(f"» Gradient accumulation steps: {Colors.highlight(cfg.training.grad_steps)}"))
+    training_console.print(Colors.info(f"» Target training tokens: {Colors.highlight(f'{target_tokens:,}')}"))
 
     train_start_time = time.time()
 
@@ -962,6 +973,7 @@ def run_training(cfg: Config):
     try:
         if run_status == "setup":
             training_console.update_progress_task("application", advance=1, description="Training In Progress")
+            training_console.section("Model Training Progress")
             trainer = Trainer(
                 model=model,
                 train_dataloader=train_dataloader,

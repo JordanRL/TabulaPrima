@@ -1,6 +1,11 @@
+import datetime
+import time
 from time import sleep
+from typing import Dict, Any, List
+from zoneinfo import ZoneInfo
 
 from pyfiglet import Figlet
+from rich.align import Align
 from rich.console import Console, Group
 from rich.box import Box
 from rich.layout import Layout
@@ -46,6 +51,30 @@ class Colors:
     @staticmethod
     def info(text):
         return f"[{Colors.BLUE}]{text}[/{Colors.BLUE}]"
+
+    @staticmethod
+    def yellow(text):
+        return f"[{Colors.YELLOW}]{text}[/{Colors.YELLOW}]"
+
+    @staticmethod
+    def purple(text):
+        return f"[{Colors.PURPLE}]{text}[/{Colors.PURPLE}]"
+
+    @staticmethod
+    def purple2(text):
+        return f"[{Colors.PURPLE2}]{text}[/{Colors.PURPLE2}]"
+
+    @staticmethod
+    def progress_fill(text):
+        return f"[{Colors.PROGRESS_FILL}]{text}[/{Colors.PROGRESS_FILL}]"
+
+    @staticmethod
+    def medium_grey(text):
+        return f"[{Colors.MED_GREY}]{text}[/{Colors.MED_GREY}]"
+
+    @staticmethod
+    def orange(text):
+        return f"[{Colors.ORANGE}]{text}[/{Colors.ORANGE}]"
 
     @staticmethod
     def success(text):
@@ -182,7 +211,9 @@ class TPConsole:
     _app_title = "Tabula Prima"
     _app_subtitle = "Training"
     _app_stage = "Bootstrapping"
-    _messages = []
+    _messages: List[Dict[str, Any]] = []
+    _tz_info = None
+    _section_titles = []
     _main_content_panel = Panel(
         "",
         expand=True, border_style="none", box=EMPTY_BOX, padding=0
@@ -197,6 +228,7 @@ class TPConsole:
             cls._console = Console(soft_wrap=True, color_system="truecolor")
             cls._use_live = use_live
             if use_live:
+                cls._tz_info = ZoneInfo("America/Los_Angeles")
                 cls._title_content_layout = Layout(cls._tabula_prima_fig, name="title", size=3)
                 cls._main_content_layout = Layout(cls._main_content_panel, name="main")
                 cls._progress_content_layout = Layout(name="progress", size=6)
@@ -236,20 +268,51 @@ class TPConsole:
         self._console.print_exception()
 
     def print(self, content: str):
-        if self._use_live:
-            self._messages.append(content.replace("\n", ""))
-            self._update_main_render()
-        else:
-            self._console.print(content)
+        self._print_single_message(content)
+
+    def print_list_item(self, title: str, content: str):
+        text = f"{Colors.purple('»')} {Colors.info(title)}: {Colors.highlight(content)}"
+        self._print_single_message(text)
+
+    def print_list(self, items: List[Dict[str, str]]):
+        for item in items:
+            self.print_list_item(item["title"], item["content"])
+
+    def print_notification(self, content: str):
+        text = f"{Colors.purple('ⓘ')} {Colors.info(content)}"
+        self._print_single_message(text)
+
+    def print_warning(self, content: str):
+        text = f"{Colors.purple('⚠')} {Colors.warning(content)}"
+        self._print_single_message(text)
+
+    def print_error(self, content: str):
+        text = f"{Colors.orange('ⓧ')} {Colors.error(content)}"
+        self._print_single_message(text)
+
+    def print_complete(self, content: str):
+        text = f"{Colors.success('✔')} {Colors.info(content)}"
+        self._print_single_message(text)
 
     def rule(self, content, style=Colors.HEADER):
         if self._use_live:
-            self._messages.append("")
-            self._messages.append(f"[{style}]>>[/{style}] {content} [{style}]<<[/{style}]")
-            self._messages.append("")
+            self._messages.append(self._format_message("", False))
+            self._messages.append(self._format_message(f"[{style}]>>[/{style}] {content} [{style}]<<[/{style}]", False))
+            self._messages.append(self._format_message("", False))
             self._update_main_render()
         else:
             self._console.rule(content, style=style)
+
+    def section(self, content: str):
+        title_text = Colors.apply_gradient_to_lines(Figlet(font='cybermedium', width=160).renderText(content), Colors.BLUE, Colors.HEADER, False, True)
+        if self._use_live:
+            idx = len(self._section_titles)
+            self._section_titles.append(title_text)
+            for j in range(len(title_text.splitlines())):
+                self._messages.append(self._format_section_title(title_text, idx))
+            self._update_main_render()
+        else:
+            self._console.print(Align.center(Text.from_markup(title_text)))
 
     def update_app_title(self, title: str):
         self._app_title = title
@@ -263,13 +326,13 @@ class TPConsole:
     def update_app_stats(self, stats: dict):
         if self._stats_panel is not None:
             self._stats.update(stats)
-            stats_string = f"{self._stats_title}\n"
+            stats_string = f"{Colors.header(self._stats_title)}\n"
             items_count = 0
             for stat_name, stat_value in self._stats.items():
-                if items_count % 8:
+                if items_count % 8 == 0 and items_count > 0:
                     stats_string += "\n"
                 elif items_count > 0:
-                    stats_string += " " * 3 + "|" + " " * 3
+                    stats_string += " " * 2 + "|" + " " * 2
                 stats_string += f"{Colors.info(stat_name)}: {Colors.highlight(stat_value)}"
                 items_count += 1
             self._stats_panel.update(Text.from_markup(stats_string))
@@ -303,15 +366,75 @@ class TPConsole:
     def has_progress_task(self, task_name: str):
         return task_name in self._progress_tasks
 
+    def _print_single_message(self, text, with_time=True):
+        if self._use_live:
+            self._messages.append(self._format_message(text, with_time))
+            self._update_main_render()
+        else:
+            self._console.print(text)
+
+    def _format_message(self, message, with_time=True):
+        return {
+            "message": message.replace("\n", ""),
+            "time": time.time() if with_time else None,
+        }
+
+    def _format_section_title(self, title, idx):
+        return {
+            "message": "",
+            "time": None,
+            "ref": idx,
+            "height": len(title.splitlines())
+        }
+
     def _update_main_render(self):
         if self._use_live:
             message_line_count = self._console.size.height
             if self._layout['progress'].visible:
-                message_line_count -= 10 # Progress/Stats panel
+                message_line_count -= 6 # Progress/Stats panel
             message_line_count -= 3  # Title bar
             message_line_count -= 3  # Top and bottom padding
-            text = "\n".join(self._messages[-message_line_count:])
-            self._main_content_panel.renderable = Text.from_markup(text)
+            displayed_messages = self._messages[-message_line_count:]
+            section = 0
+            section_processed = False
+            titles = []
+            texts = []
+            text = ""
+            for j in range(len(displayed_messages)):
+                if "ref" in displayed_messages[j].keys():
+                    if not section_processed:
+                        texts.append(text)
+                        text = ""
+                        section_processed = True
+                        section += 1
+                        titles.append(self._section_titles[displayed_messages[j]["ref"]])
+                    else:
+                        continue
+                else:
+                    section_processed = False
+                    if text != "":
+                        text += "\n"
+                    if displayed_messages[j]["time"] is not None:
+                        dt_utc = datetime.datetime.fromtimestamp(displayed_messages[j]['time'], tz=datetime.timezone.utc)
+                        dt_target_tz = dt_utc.astimezone(self._tz_info)
+                        text += f" [[{Colors.ORANGE}]{dt_target_tz.strftime('%I:%M:%S %p')}[/{Colors.ORANGE}]] {displayed_messages[j]['message']}"
+                    else:
+                        text += f"               {displayed_messages[j]['message']}"
+            texts.append(text)
+            if section == 0:
+                self._main_content_panel.renderable = Text.from_markup(text)
+            else:
+                renderables = []
+                max_text_index = len(texts)-1
+                max_title_index = len(titles)-1
+                max_index = max(max_text_index, max_title_index)
+                for k in range(max_index+1):
+                    if k <= max_text_index:
+                        renderables.append(Text.from_markup(texts[k]))
+                    if k <= max_title_index:
+                        renderables.append(Align.center(Text.from_markup(titles[k])))
+                self._main_content_panel.renderable = Group(*renderables)
+
 
     def _create_progress_bar(self, use_stats):
         spinner_col = SpinnerColumn(table_column=Column(max_width=3))

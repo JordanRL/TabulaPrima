@@ -8,6 +8,8 @@ import torch.nn.functional as F
 import os
 import time
 
+from hydra.utils import to_absolute_path
+
 from config_schema import TrainingConfig
 from console import TPConsole
 
@@ -73,8 +75,12 @@ class TrainingState:
     epochs: int
     optimizer_steps: int
     inference_steps: int
+    time_of_last_instrument: float
     steps_since_instrument: int
     steps_since_eval: int
+    total_instrument_events: int
+    total_eval_events: int
+    time_per_instrument: float
     steps_per_instrument: int
     steps_per_eval: int
     steps_per_gradient_update: int
@@ -87,6 +93,7 @@ class TrainingState:
     allow_amp_switchover: bool
     stability_steps: int
     stability_reached: bool
+    use_time_based_instrument: bool
 
     # Optional
     scheduler_mode: Literal["tokens", "epochs"]|None = None
@@ -94,10 +101,17 @@ class TrainingState:
     target_epochs: int = 0
 
     def should_instrument(self):
-        return self.steps_since_instrument >= self.steps_per_instrument or self.steps_since_eval >= self.steps_per_eval
+        if self.use_time_based_instrument:
+            return (
+                    time.time() - self.time_of_last_instrument >= self.time_per_instrument
+                    and self.steps_since_instrument > 0
+                    and self.optimizer_steps >= self.steps_per_gradient_update
+            ) or self.should_eval()
+        else:
+            return self.steps_since_instrument >= self.steps_per_instrument or self.should_eval()
 
     def should_eval(self):
-        return self.steps_since_eval >= self.steps_per_eval
+        return self.steps_since_eval >= self.steps_per_eval and self.run_phase != "warmup"
 
     def finish_batch(self, micro_batch_size):
         self.batches_seen += micro_batch_size
@@ -178,6 +192,7 @@ class TrainingState:
 
     def reset_steps_since_instrument(self):
         self.steps_since_instrument = 0
+        self.time_of_last_instrument = time.time()
 
     def increment_steps_since_eval(self):
         self.steps_since_eval += 1
@@ -264,6 +279,11 @@ class Trainer:
             allow_amp_switchover=self.cfg.allow_amp_switchover,
             steps_per_gradient_update=self.cfg.grad_steps,
             tokens_per_batch=0,
+            use_time_based_instrument=self.cfg.wandb.use_time_based_instrument,
+            time_per_instrument=1/self.cfg.wandb.instruments_per_second if self.cfg.wandb.instruments_per_second != 0 else 1,
+            time_of_last_instrument=0,
+            total_instrument_events=0,
+            total_eval_events=0,
         )
         self.wandb = wandb
         self.scaler = torch.amp.GradScaler() if self.training_state.use_amp and not torch.cuda.is_bf16_supported() else None
@@ -290,6 +310,7 @@ class Trainer:
 
         # Tracking training dynamics
         self.start_time = time.time()
+        self.training_state.time_of_last_instrument = self.start_time
         self.last_checkpoint_time = self.start_time
 
         while self.training_state.tokens_seen < self.training_state.target_tokens:
@@ -512,8 +533,8 @@ class Trainer:
         actual_tokens_in_batch = self.attention_mask.sum().item()
 
         # Initialize logging dicts
-        training_dict = {}
-        eval_dict = {}
+        training_dict = None
+        eval_dict = None
 
         # Forward pass with mixed precision
         loss = self._bidirectional()
@@ -553,8 +574,10 @@ class Trainer:
             if self.training_state.run_phase == "warmup" and self.training_state.stability_reached == True:
                 self.training_state.update_run_phase("core learning")
                 precision_mode = self.training_state.get_current_precision_mode()
-                self.console.update_progress_task("training",
-                                                  description=f"Phase: {self.training_state.run_phase.title()} ({precision_mode})")
+                self.console.update_progress_task(
+                    "training",
+                    description=f"Phase: {self.training_state.run_phase.title()} ({precision_mode})"
+                )
 
                 if self.cfg.allow_amp_switchover and self.training_state.use_amp == False:
                     self.training_state.use_amp = True
@@ -568,20 +591,22 @@ class Trainer:
         self.console.update_app_stats({
             "Tokens/s": f"{self.training_state.tokens_per_sec:.2f}",
             "Loss": f"{self.training_state.current_loss:.4f}",
-            "Perplexity": f"{self.training_state.current_perplexity:.4f}",
-            "Grad Norm": f"{pre_clip_grad_norm:.4f}",
-            "Learning Rate": f"{self.scheduler.get_last_lr()[0]:.6f}",
-            "Steps Since Instrument": self.training_state.steps_since_instrument,
-            "Steps Since Eval": self.training_state.steps_since_eval,
+            "Perplexity": f"{self.training_state.current_perplexity:,.2f}",
+            "Grad Norm": f"{sum(self.training_state.grad_norm_history[-self.cfg.grad_steps:]) / self.cfg.grad_steps:.4f}",
+            "Learning Rate": f"{self.scheduler.get_last_lr()[0]:.4e}",
+            "W&B Logs": f"{self.training_state.total_instrument_events:,}",
+            "Evals": f"{self.training_state.total_eval_events:,}",
             "Tokens/Batch": f"{self.training_state.tokens_per_batch:.2f}",
         })
 
         if self.training_state.should_instrument():
             self.training_state.reset_steps_since_instrument()
+            self.training_state.total_instrument_events += 1
             training_dict = self.training_state.get_instrument_dict(self.scheduler.get_last_lr()[0])
 
-            if self.training_state.should_eval() and self.training_state.run_phase != "warmup":
+            if self.training_state.should_eval():
                 # Run evaluation
+                self.training_state.total_eval_events += 1
                 eval_results = self.evaluate()
                 self.training_state.reset_steps_since_eval()
                 test_loss = eval_results.loss
@@ -595,6 +620,13 @@ class Trainer:
                     "eval/test_perplexity": test_perplexity,
                     "eval/test_accuracy": test_accuracy,
                 }
+
+                self.console.update_app_stats({
+                    "Last Eval Loss": f"{test_loss:.4f}",
+                    "Last Eval Perplexity": f"{test_perplexity:,.4f}",
+                    "Last Eval Accuracy": f"{test_accuracy:.4f}",
+                })
+
                 self.model.train()
 
         log_dict = {}

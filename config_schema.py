@@ -1,6 +1,6 @@
 # configs/schemas.py
 from dataclasses import dataclass, field
-from typing import List, Any, Tuple, Optional
+from typing import List, Tuple
 
 from omegaconf import MISSING # Required for mandatory fields
 
@@ -16,18 +16,20 @@ class OptimizerConfig:
 class SchedulerConfig:
     _target_: str = MISSING # Class path
     max_lr: float = MISSING
-    min_lr: Optional[float] = None # Use Optional for non-mandatory
+    min_lr: float = 0.0 # Use Optional for non-mandatory
     warmup_ratio: float = 0.08
     # target_total_tokens is runtime, so not typically in schema
 
 @dataclass
 class WandbConfig:
-    silent: bool = True
+    use_time_based_instrument: bool = MISSING
+    instruments_per_second: int = MISSING
+    log: bool = MISSING
+    silent: bool = MISSING
     run_name: str = "DefaultRun"
     project: str = "TabulaPrima"
-    entity: Optional[str] = None
+    entity: str = "jordan-ledoux-none"
     tags: List[str] = field(default_factory=lambda: ["experiment", "pretraining"])
-    log: bool = True
 
 @dataclass
 class TrainingConfig:
@@ -67,19 +69,20 @@ class ModelConfig:
     dropout: float = MISSING
     max_seq_len: int = MISSING
     use_checkpointing: bool = MISSING
-    use_fusions: bool = MISSING
+    use_fusion: bool = MISSING
     # vocab_size: int = MISSING # Runtime
 
 @dataclass
 class DatasetConfig:
     name: str = MISSING
-    subset: Optional[str] = None
+    subset: str = MISSING
     dataset_type: str = "hf"
     stream_dataset: bool = False
     cache_dir: str = "dataset_cache"
     no_cache: bool = False
     clear_cache: bool = False
     seq_length: int = MISSING
+    num_workers: int = 2
 
 @dataclass
 class Tokenizer:
@@ -101,15 +104,6 @@ class GPT2Tokenizer(Tokenizer):
 # --- Main Application Config Schema ---
 @dataclass
 class Config:
-    # Defaults list allows Hydra to find the config groups
-    defaults: List[Any] = field(default_factory=lambda: [
-        "_self_",
-        {"model": MISSING},
-        {"training": MISSING},
-        {"dataset": MISSING},
-        {"tokenizer": MISSING}
-    ])
-
     # Top-level parameters
     use_live_display: bool = False
     use_stats: bool = False

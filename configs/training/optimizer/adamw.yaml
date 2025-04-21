@@ -1,5 +1,4 @@
-# @package _group_
-_target_: torch.optim.AdamW
+# @package training.optimizer
+_target_: "torch.optim.AdamW"
 lr: ${training.learning_rate}
 weight_decay: ${training.weight_decay}
-betas: [0.9, 0.95]

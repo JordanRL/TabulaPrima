@@ -4,3 +4,5 @@ project: "TabulaPrima"
 entity: "jordan-ledoux-none"
 tags: ["experiment", "generic-dataset", "pretraining"]
 log: true
+use_time_based_instrument: true
+instruments_per_second: 5

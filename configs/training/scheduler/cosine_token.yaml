@@ -1,5 +1,5 @@
-# @package _group_
-_target_: train_harness.TokenBasedCosineLRScheduler
+# @package training.scheduler
+_target_: "train_harness.TokenBasedCosineLRScheduler"
 max_lr: ${training.learning_rate}
-min_lr: ${eval:'${training.learning_rate} / 10'}
+min_lr: 0
 warmup_ratio: 0.08

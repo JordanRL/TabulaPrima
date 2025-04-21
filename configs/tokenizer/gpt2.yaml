@@ -1,4 +1,5 @@
 defaults:
   - gpt2_schema
+  - _self_
 
 name: gpt2

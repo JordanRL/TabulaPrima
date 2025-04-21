@@ -1,5 +1,6 @@
 defaults:
   - tiktoken_schema
+  - _self_
 
 name: tiktoken
 encoding_name: cl100k_base

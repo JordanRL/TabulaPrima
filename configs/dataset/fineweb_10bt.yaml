@@ -1,13 +1,14 @@
 defaults:
+  - dataset_schema
   - _self_
 
 # @package training.dataset
-name: wikitext
-subset: "wikitext-103-raw-v1"
+name: "HuggingFaceFW/fineweb"
+subset: "sample-10BT"
 dataset_type: hf
-stream_dataset: false
+stream_dataset: true
 cache_dir: "dataset_cache"
 no_cache: false
 clear_cache: false
 seq_length: ${model.max_seq_len}
-num_workers: 2
+num_workers: 4
