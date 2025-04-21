@@ -583,13 +583,13 @@ def run_training(cfg: Config):
                 trust_remote_code=True,
                 cache_dir=cfg.dataset.cache_dir
             )
-            training_console.print_complete("Streaming dataset initialized")
             core_dataset = core_dataset.map(tokenize_example, batched=True)
             core_dataset = core_dataset.shuffle(seed=1240, buffer_size=10000)
+            training_console.print_complete("Streaming dataset initialized")
 
             training_console.print_notification("Splitting streaming dataset into train and test sets")
-            test_dataset = core_dataset.take(1000)
-            train_dataset = core_dataset.skip(1000)
+            test_dataset = core_dataset.take(cfg.training.eval_split_size)
+            train_dataset = core_dataset.skip(cfg.training.eval_split_size)
             training_console.print_complete("Split finished, dataset ready to train")
         else:
             # Use the cached dataset implementation
@@ -757,7 +757,7 @@ def run_training(cfg: Config):
 
                 test_dataloader = DataLoader(
                     test_dataset,
-                    batch_size=cfg.training.batch_size,
+                    batch_size=1,
                     num_workers=2,
                     collate_fn=collate_fn_stream
                 )
@@ -772,7 +772,7 @@ def run_training(cfg: Config):
 
                 test_dataloader = DataLoader(
                     test_dataset,
-                    batch_size=cfg.training.batch_size,
+                    batch_size=1,
                     shuffle=False,
                     num_workers=2,
                     collate_fn=collate_fn

@@ -388,7 +388,10 @@ class Trainer:
         total_tokens = 0
         batch_counter = 0
 
-        self.console.create_progress_task("eval", "Evaluating", total=1000)
+        if self.cfg.eval_split_size is not None:
+            self.console.create_progress_task("eval", "Evaluating", total=self.cfg.eval_split_size)
+        else:
+            self.console.create_progress_task("eval", "Evaluating", total=len(self.test_dataloader))
 
         with torch.no_grad():
             for batch in self.test_dataloader:

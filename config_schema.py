@@ -41,6 +41,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     log_interval: int = 10
     eval_interval: int = 100
+    eval_split_size: int|None = None
     use_amp: bool = False
     allow_amp_switchover: bool = False
     use_checkpointing: bool = False

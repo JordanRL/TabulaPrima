@@ -14,6 +14,7 @@ weight_decay: 0.01
 max_grad_norm: 1.0
 log_interval: 10
 eval_interval: 100
+eval_split_size: 500
 use_amp: false
 allow_amp_switchover: true
 use_checkpointing: false
