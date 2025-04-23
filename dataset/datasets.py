@@ -8,13 +8,18 @@ import hydra.utils
 import torch
 import os
 
+from datasets.iterable_dataset import _BaseExamplesIterable
 from smart_open import smart_open
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
+from torch.utils.data._utils.worker import WorkerInfo
 from transformers import PreTrainedTokenizerFast
 from tqdm import tqdm
-from datasets import load_dataset, StreamingDownloadManager, get_dataset_infos
+from datasets import load_dataset, StreamingDownloadManager, get_dataset_infos, DownloadConfig, DatasetDict, Dataset, \
+    IterableDatasetDict, IterableDataset
+
+from config_schema import DatasetConfig
 from console import Colors, TPConsole
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Iterable
 from datasets.utils.logging import set_verbosity_error as set_datasets_verbosity_error
 from pprint import pprint
 
@@ -25,58 +30,83 @@ class TPDataset(Dataset):
         self.seq_length = seq_length
 
 class TPIterableDataset(IterableDataset):
-    def __init__(self, tokenizer, max_seq_length):
+    worker_info: WorkerInfo | None
+
+    def __init__(self, tokenizer, cfg: DatasetConfig, ex_iterable: _BaseExamplesIterable):
+        super().__init__(ex_iterable)
         self.tokenizer = tokenizer
-        self.max_seq_length = max_seq_length
+        self.max_seq_length = cfg.seq_length
 
         # --- Get Distributed Information ---
         if dist.is_available() and dist.is_initialized():
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
+            self.using_dist = True
         else:
-            self.rank = None
-            self.world_size = None
+            self.rank = 0
+            self.world_size = 1
+            self.using_dist = False
 
         self.worker_info = get_worker_info()
 
     def __iter__(self):
         return self
 
-class HFStreamingDataset(TPIterableDataset):
-    def __init__(self,
-                 dataset_path: str,
-                 dataset_name: Optional[str],
-                 split: str,
-                 tokenizer: Any,
-                 max_seq_length: int,
-                 text_column: str = "text"):
-        super().__init__(tokenizer=tokenizer, max_seq_length=max_seq_length)
-        self.dataset_path = dataset_path
-        self.dataset_name = dataset_name
+class TPStreamingDataset(TPIterableDataset):
+    stream_handle: IterableDatasetDict | IterableDataset
+    current_file_index: int
+    current_record_index: int
+    text_column: str
+    split: str
+    dataset_name: str
+    dataset_path: str
+
+    def __init__(
+            self,
+            tokenizer: Any,
+            split: str,
+            cfg: DatasetConfig,
+            text_column: str = "text",
+            shuffle_seed: int = 42,
+    ) -> None:
+
+        super().__init__(tokenizer=tokenizer, cfg=cfg)
+        self.dataset_path = cfg.dataset_path
+        self.dataset_name = cfg.name
         self.split = split
         self.text_column = text_column
 
-        if self.rank is not None and self.worker_info is not None:
-            if self.rank == 0 and self.worker_info.id == 0:
-                self.stream_handle = load_dataset(
-                    self.dataset_path,
-                    self.dataset_name,
-                    split=self.split,
-                    streaming=True,
-                    cache_dir=os.path.join(os.getcwd(), "hf_cache"),
-                )
-                get_dataset_infos(self.dataset_path)
+        if self.worker_info is not None:
+            self.num_workers = self.worker_info.num_workers if self.worker_info else 1
+            self.effective_rank = self.rank * self.num_workers + self.worker_info.id
+            self.effective_world_size = self.world_size * self.num_workers
+        else:
+            self.num_workers = 1
+            self.effective_rank = self.rank
+            self.effective_world_size = self.world_size
 
-        # Optional: Get total number of examples if needed for progress bars, etc.
-        # try:
-        #     infos = get_dataset_infos(self.dataset_path)
-        #     config_key = self.dataset_name if self.dataset_name else list(infos.keys())[0]
-        #     self.num_examples = infos[config_key].splits[self.split].num_examples
-        #     logger.info(f"Reported number of examples: {self.num_examples}")
-        # except Exception as e:
-        #     logger.warning(f"Could not fetch exact number of examples: {e}")
-        #     self.num_examples = None
+        self.current_record_index = 0
+        self.current_file_index = 0
+        self.stream_handle = load_dataset(
+            self.dataset_path,
+            self.dataset_name,
+            split=self.split,
+            download_config=DownloadConfig(disable_tqdm=True),
+            streaming=True,
+            cache_dir=None,
+        )
 
+        self.stream_handle.shuffle(seed=shuffle_seed)
+
+        # Rank 0 Worker 0 is the only one that retrieves the files
+        if self.using_dist and self.effective_rank == 0:
+            dl_manager = StreamingDownloadManager(
+                base_path=self.dataset_path,
+                download_config=DownloadConfig(disable_tqdm=True),
+                dataset_name=self.dataset_name,
+            )
+
+            # TODO: Finish implementation
 
     def _parse_and_tokenize(self, line: str) -> Optional[Dict[str, torch.Tensor]]:
         """Parses a line (assuming JSONL) and tokenizes it."""
@@ -300,7 +330,7 @@ class HFDataset(Dataset):
         }
 
 
-class CachedHFDataset(Dataset):
+class CachedHFDataset:
     def __init__(
             self,
             tokenizer: PreTrainedTokenizerFast,
@@ -345,7 +375,6 @@ class CachedHFDataset(Dataset):
 
         # Try to load from cache first
         self.examples = self._load_from_cache()
-        was_cached = self._was_cached()
 
         # If not in cache, process the dataset and save to cache
         if self.examples is None:

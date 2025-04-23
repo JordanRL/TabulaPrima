@@ -15,6 +15,8 @@ model:
 training:
   batch_size: 4
   eval_interval: 500
+dataset:
+  batch_size: ${training.batch_size}
 
 # Define where Hydra should store outputs (logs, saved configs, checkpoints if not overridden)
 # Hydra automatically creates dated/timed subdirectories here

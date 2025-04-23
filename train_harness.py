@@ -1,8 +1,5 @@
 import logging
 import math
-import datetime
-import traceback
-from traceback import FrameSummary
 from typing import Optional, Dict, Any, List
 
 import hydra.utils
@@ -21,7 +18,7 @@ from datasets import load_dataset
 from config_schema import Config, DatasetType
 from console import Colors, TPConsole
 from model_arch import MLATransformer
-from trainer import Trainer
+from trainers.default import Trainer
 from dataset.datasets import CachedHFDataset, HFDataset
 
 
@@ -676,7 +673,6 @@ def run_training(cfg: Config):
     try:
         if run_status == "setup":
             training_console.update_progress_task("application", advance=1, description="Training In Progress")
-            training_console.section("Pre-Training Progress")
             trainer = Trainer(
                 model=model,
                 train_dataloader=train_dataloader,
@@ -690,6 +686,7 @@ def run_training(cfg: Config):
             trained_tokens, run_status = trainer.run_tokens(target_tokens)
             if run_status == "failed" and cfg.training.wandb.log:
                 wandb.run.status = run_status
+            training_console.remove_columns_from_main()
             training_console.section("Training Completed")
         else:
             training_console.update_progress_task("application", advance=1, description="Training Skipped")

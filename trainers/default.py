@@ -1,15 +1,18 @@
 import math
 import datetime
-
 import torch
 import torch.nn.functional as F
 import os
 import time
-
 import wandb
+from rich.align import Align
+from rich.console import Group
+from rich.layout import Layout
+from rich.text import Text
 
 from config_schema import TrainingConfig
 from console import TPConsole, Colors
+from .utils import TrainingState, TrainingPhases, EvaluationResult
 
 
 class Trainer:
@@ -73,6 +76,8 @@ class Trainer:
         self.labels = None
         self.last_checkpoint_time = None
         self.start_time = None
+        self.train_info_col = None
+        self.train_info_col_header = Align.center(Text.from_markup(f"{Colors.header('Train Info')}"))
         self.console = TPConsole()
 
     def state_dict(self):
@@ -114,6 +119,17 @@ class Trainer:
         return trainer
 
     def run_tokens(self, target_tokens):
+        self.console.new_main_content()
+        train_info_col = self.console.add_column_to_main(width=40)
+
+        self.train_info_col = train_info_col
+
+        self.console.update_column_content(train_info_col, Group(
+            self.train_info_col_header,
+            Text.from_markup("\n\n"+"\n".join(self.console.print_list(self.training_state.train_info_panel_content(), True)))
+        ))
+
+        self.console.section("Pre-Training Progress")
         self.console.rule(f"Training for {Colors.highlight(f'{target_tokens:,}')} tokens")
 
         self.model.train()
@@ -144,6 +160,11 @@ class Trainer:
 
                 if not batch_result:
                     return self.training_state.tokens_seen, "failed"
+
+                self.console.update_column_content(train_info_col, Group(
+                    self.train_info_col_header,
+                    Text.from_markup("\n\n"+"\n".join(self.console.print_list(self.training_state.train_info_panel_content(), True)))
+                ))
 
                 cli_interval = time.time() - last_cli_update_time
                 if cli_interval > self.cfg.update_interval:
@@ -211,7 +232,7 @@ class Trainer:
             "wandb_run_id": self.wandb.run.id if self.wandb is not None else None,
         }, checkpoint_path)
         self.console.print_complete(f"Checkpoint saved to file {Colors.header(checkpoint_path)}")
-        if self.wandb is not None and self.cfg.wandb.save_checkpoints:
+        if self.wandb is not None and self.cfg.wandb.log and self.cfg.wandb.save_checkpoints:
             self.console.print_notification("Sending checkpoint to W&B")
             checkpoint_artifact = wandb.Artifact(name="checkpoints", type="model")
             checkpoint_artifact.add_file(checkpoint_path)
@@ -477,7 +498,7 @@ class Trainer:
         if eval_dict is not None:
             log_dict.update(eval_dict)
 
-        if len(log_dict) > 0:
+        if len(log_dict) > 0 and self.cfg.wandb.log and self.wandb is not None:
             self.wandb.log(log_dict)
 
         if (time.time() - self.last_checkpoint_time) >= self.training_state.checkpoint_interval:

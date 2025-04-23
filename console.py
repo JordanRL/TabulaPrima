@@ -13,7 +13,7 @@ from pyfiglet import Figlet
 from readchar import readkey, key
 from rich.align import Align
 from rich.console import Console, Group, RenderableType, RichCast, ConsoleRenderable
-from rich.box import Box
+from rich.box import Box, SQUARE, ROUNDED
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -324,7 +324,8 @@ class TPConsole:
     _progress_panel: Layout|None = None
     _alternate_screens = []
     _alternate_screen_items = []
-    _main_content_cols = []
+    _main_content_cols: List[Layout] = []
+    _main_content_cols_panels: List[Panel] = []
 
     # Default text content
     _app_title = "Tabula Prima"
@@ -415,13 +416,25 @@ class TPConsole:
     def print(self, content: str):
         self._print_single_message(content)
 
-    def print_list_item(self, title: str, content: str):
+    def print_list_item(self, title: str, content: str, returns: bool = False):
         text = f"{Colors.purple('»')} {Colors.info(title)}: {Colors.highlight(content)}"
-        self._print_single_message(text)
+        if not returns:
+            self._print_single_message(text)
+            return None
+        else:
+            return text
 
-    def print_list(self, items: List[Dict[str, str]]):
+    def print_list(self, items: List[Dict[str, str]], returns: bool = False):
+        output = []
         for item in items:
-            self.print_list_item(item["title"], item["content"])
+            if not returns:
+                self.print_list_item(item["title"], item["content"])
+            else:
+                output.append(self.print_list_item(item["title"], item["content"], returns))
+        if returns:
+            return output
+        else:
+            return None
 
     def print_notification(self, content: str):
         text = f"{Colors.purple('ⓘ')} {Colors.info(content)}"
@@ -509,21 +522,45 @@ class TPConsole:
             self._console.clear()
             return None
 
-    def add_column_to_main(self, layout: Layout, content: RenderableType|None = None):
+    def update_column_content(self, col_idx: int, content: str|RenderableType|None = None):
         if self._cfg.use_live_display:
+            if isinstance(content, str):
+                for line in content.splitlines():
+                    self._main_content_cols_panels[col_idx].renderable = Text.from_markup(line)
+            elif isinstance(content, RenderableType):
+                self._main_content_cols_panels[col_idx].renderable = content
+
+    def add_column_to_main(self, width: int = 25, content: RenderableType|None = None):
+        if self._cfg.use_live_display:
+            col_idx = len(self._main_content_cols)
+            new_col_name = f"col_{col_idx}"
+            layout = Layout(name=new_col_name, size=width)
+            if content is None:
+                content = Panel(
+                    "",
+                    expand=True, border_style=Colors.HEADER, box=SQUARE, padding=0
+                )
+            layout.update(content)
             if len(self._main_content_layout.children) == 0:
                 sub_main_layout = Layout(self._main_content_panel, name="sub_main")
                 self._main_content_layout.split_row(sub_main_layout, layout)
             else:
-                self._main_content_layout.split_row(layout)
+                self._main_content_layout.add_split(layout)
             self._main_content_cols.append(layout)
-            if content is not None:
-                layout.update(content)
-            col_idx = len(self._main_content_cols) - 1
+            self._main_content_cols_panels.append(content)
+            self._main_content_panel.width = self._console.width - sum([layout.size for layout in self._main_content_cols])
             self._update_main_render()
             return col_idx
         else:
             return None
+
+    def remove_columns_from_main(self):
+        if self._cfg.use_live_display:
+            if len(self._main_content_cols) > 0:
+                self._main_content_cols = []
+                self._main_content_layout.unsplit()
+                self._main_content_layout.update(self._main_content_panel)
+                self._update_main_render()
 
     def update_app_title(self, title: str):
         self._app_title = title
@@ -715,7 +752,13 @@ class TPConsole:
                 message_line_count -= 6 # Progress/Stats panel
             message_line_count -= 3  # Title bar
             message_line_count -= 2  # Top and bottom border
-            message_line_width = self._main_content_panel.width or self._console.width
+            if len(self._main_content_layout.children) > 0:
+                if self._main_content_layout.get("sub_main").size is not None:
+                    message_line_width = self._main_content_layout.get("sub_main").size
+                else:
+                    message_line_width = self._console.width - sum([layout.size for layout in self._main_content_cols])
+            else:
+                message_line_width = self._main_content_panel.width or self._console.width
             message_line_width -= 2 # Left and right border
             content_items = self._content_items.copy()
             content_items.reverse()

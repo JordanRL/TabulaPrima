@@ -101,6 +101,7 @@ class DatasetConfig:
     no_cache: bool = False
     clear_cache: bool = False
     eval_split_size: int|None = None
+    batch_size: int = 1
 
 @dataclass
 class TextDatasetConfig(DatasetConfig):

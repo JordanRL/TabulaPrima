@@ -262,6 +262,40 @@ class TrainingState:
 
         return False
 
+    def train_info_panel_content(self):
+        gpu_mem_used = torch.cuda.memory_allocated() / 1024**3
+        gpu_mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        gpu_mem_util = torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory
+        gpu_util = torch.cuda.utilization()
+        if gpu_mem_util >= 1 or gpu_mem_util <= 0.5:
+            gpu_mem_text = Colors.error(f"{gpu_mem_used:.2f}GB/{gpu_mem_total:.2f}GB")
+            gpu_mem_util_text = Colors.error(f"{gpu_mem_util*100:.2f}%")
+        elif gpu_mem_util >= 0.95 or gpu_mem_util <= 0.75:
+            gpu_mem_text = Colors.warning(f"{gpu_mem_used:.2f}GB/{gpu_mem_total:.2f}GB")
+            gpu_mem_util_text = Colors.warning(f"{gpu_mem_util*100:.2f}%")
+        else:
+            gpu_mem_text = Colors.success(f"{gpu_mem_used:.2f}GB/{gpu_mem_total:.2f}GB")
+            gpu_mem_util_text = Colors.success(f"{gpu_mem_util*100:.2f}%")
+        if gpu_util <= 50:
+            gpu_util_text = Colors.error(f"{gpu_util}%")
+        elif gpu_util <= 90:
+            gpu_util_text = Colors.warning(f"{gpu_util}%")
+        else:
+            gpu_util_text = Colors.success(f"{gpu_util}%")
+        return [
+            {"title": "World Size", "content": f"{torch.cuda.device_count()} GPUs"},
+            {"title": "GPU Usage", "content": f"{gpu_util_text}"},
+            {"title": "GPU Memory", "content": f"{gpu_mem_text}"},
+            {"title": "GPT Memory Usage", "content": f"{gpu_mem_util_text}"},
+            {"title": "Run Phase", "content": self.run_phase.value.title() if self.run_phase else "N/A"},
+            {"title": "Current Precision Mode", "content": self.get_current_precision_mode()},
+            {"title": "Tokens Seen", "content": f"{self.tokens_seen:,}"},
+            {"title": "Target Tokens", "content": f"{self.target_tokens:,}"},
+            {"title": "Optimizer Steps", "content": f"{self.optimizer_steps}"},
+            {"title": "Inference Steps", "content": f"{self.inference_steps}"},
+            {"title": "Stability Reached", "content": f"{Colors.success('Yes') if self.stability_reached else Colors.error('No')}"},
+        ]
+
     def state_dict(self):
         return {
             "loss_history": self.loss_history,

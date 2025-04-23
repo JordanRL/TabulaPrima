@@ -9,6 +9,8 @@ defaults:
   - console: with_live
 
 float_32_precision: highest
+dataset:
+  batch_size: ${training.batch_size}
 
 # Define where Hydra should store outputs (logs, saved configs, checkpoints if not overridden)
 # Hydra automatically creates dated/timed subdirectories here
