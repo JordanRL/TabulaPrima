@@ -2,15 +2,15 @@ defaults:
   - _self_
 
 # @package model
-hidden_dim: 1152
-num_layers: 12
-num_heads: 9
-ff_dim: 4608
-kv_latent_dim: 288
-q_latent_dim: 288
+hidden_dim: 2048
+num_layers: 26
+num_heads: 16
+ff_dim: 8192
+kv_latent_dim: 512
+q_latent_dim: 512
 dropout: ${training.dropout}
-max_seq_len: 512
+max_seq_len: 2048
 rope_head_dim: 32
 use_gradient_checkpointing: ${training.use_gradient_checkpointing}
 use_fusion: ${training.use_fusions}
-name: "TabulaPrima 278M"
+name: "TabulaPrima 1.3B"

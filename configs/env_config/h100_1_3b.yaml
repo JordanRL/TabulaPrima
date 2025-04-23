@@ -1,0 +1,25 @@
+# @package _global_
+defaults:
+  - override /dataset: fineweb_100bt
+  - override /tokenizer: tiktoken
+  - override /console: with_live
+  - override /model: 1_3b_params
+  - override /training: 1_3b_params
+  - _self_
+
+# Parameters that don't fit neatly into other groups (like args in train.py)
+float_32_precision: highest
+
+model:
+  max_seq_len: 2048
+training:
+  batch_size: 4
+  eval_interval: 500
+
+# Define where Hydra should store outputs (logs, saved configs, checkpoints if not overridden)
+# Hydra automatically creates dated/timed subdirectories here
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

@@ -1,0 +1,10 @@
+# @package console
+defaults:
+  - _self_
+
+use_live_display: true
+use_stats: true
+show_time: true
+timezone: "America/Los_Angeles"
+color_system: "truecolor"
+time_format: TimeFormat.DEFAULT

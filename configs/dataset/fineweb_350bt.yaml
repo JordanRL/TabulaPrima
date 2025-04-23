@@ -1,0 +1,6 @@
+defaults:
+  - fineweb_10bt
+  - _self_
+
+# @package training.dataset
+subset: "sample-350BT"

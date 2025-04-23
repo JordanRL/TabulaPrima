@@ -342,7 +342,7 @@ class TransformerLayer(nn.Module):
             dropout,
             max_seq_len,
             rope_head_dim,
-            use_checkpointing=False,
+            use_gradient_checkpointing=False,
             use_fusion=False,
     ):
         super().__init__()
@@ -360,7 +360,7 @@ class TransformerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.ff = FeedForward(hidden_dim, ff_dim, dropout)
         self.dropout = nn.Dropout(dropout)
-        self.use_checkpointing = use_checkpointing
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
     def _attention_block(self, normalized_x, attention_mask, position_ids, past_key_value, use_cache, sin_cos):
         return self.attention(
@@ -379,7 +379,7 @@ class TransformerLayer(nn.Module):
         # First sublayer: MLA with residual connection
         normalized_x = self.norm1(x)
 
-        if self.use_checkpointing and not use_cache and self.training:
+        if self.use_gradient_checkpointing and not use_cache and self.training:
             # Use checkpointing for attention if not using KV cache
             attn_output, _ = checkpoint(
                 self._attention_block,
@@ -402,7 +402,7 @@ class TransformerLayer(nn.Module):
         x = x + self.dropout(attn_output)
 
         # Second sublayer: FFN with residual connection
-        if self.use_checkpointing and self.training:
+        if self.use_gradient_checkpointing and self.training:
             ff_output = checkpoint(self._ff_block, x, use_reentrant=False)
         else:
             ff_output = self.ff(self.norm2(x))
@@ -429,13 +429,13 @@ class MLATransformer(nn.Module):
             dropout,
             max_seq_len,
             rope_head_dim,
-            use_checkpointing=False,
+            use_gradient_checkpointing=False,
             use_fusion=False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.use_checkpointing = use_checkpointing
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         self.num_heads = num_heads
 
         # Rotary embeddings (initialized with RoPE dimension d_h^R)
@@ -452,7 +452,7 @@ class MLATransformer(nn.Module):
                 dropout=dropout,
                 max_seq_len=max_seq_len,
                 rope_head_dim=rope_head_dim,
-                use_checkpointing=use_checkpointing,
+                use_gradient_checkpointing=use_gradient_checkpointing,
                 use_fusion=use_fusion
             )
             for _ in range(num_layers)

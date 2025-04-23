@@ -1,0 +1,5 @@
+defaults:
+  - fineweb_10bt
+  - _self_
+
+subset: "sample-100BT"

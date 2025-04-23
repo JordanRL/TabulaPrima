@@ -1,16 +1,21 @@
-# Default selections for different configuration groups
+# @package _global_
 defaults:
-  - config_schema
+  - override /dataset: fineweb_10bt
+  - override /tokenizer: tiktoken
+  - override /console: with_live
+  - override /model: 278m_params 
+  - override /training: 278m_params
   - _self_
-  - model: 278m_params_large_context
-  - training: 4090_base
-  - dataset: fineweb_10bt
-  - tokenizer: tiktoken
 
 # Parameters that don't fit neatly into other groups (like args in train.py)
-use_live_display: true
-use_stats: true
 float_32_precision: highest
+
+model:
+  max_seq_len: 1024
+training:
+  batch_size: 4
+  grad_steps: 8
+  eval_interval: 500
 
 # Define where Hydra should store outputs (logs, saved configs, checkpoints if not overridden)
 # Hydra automatically creates dated/timed subdirectories here

@@ -1,8 +1,0 @@
-{
-  "BATCH_SIZE": 1,
-  "GRAD_STEPS": 16,
-  "DROPOUT": 0,
-  "LEARNING_RATE": 5e-5,
-  "TOK_PER_PARAM": 10,
-  "WEIGHT_DECAY": 0.01
-}

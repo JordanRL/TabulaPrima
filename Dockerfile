@@ -5,8 +5,17 @@ FROM ${BASE_IMAGE_TAG}
 
 WORKDIR /workspace
 
-# Install git
-RUN apt-get update && apt-get install -y git --no-install-recommends && rm -rf /var/lib/apt/lists/*
+# Install git, cmake, and libaio-dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    cmake \
+    libaio-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone CUTLASS
+RUN git clone https://github.com/NVIDIA/cutlass.git /workspace/cutlass
+ENV CUTLASS_PATH=/workspace/cutlass
+ENV DS_BUILD_CUTLASS=1
 
 # Copy only the dependency file first
 COPY pyproject.toml ./
@@ -15,15 +24,11 @@ COPY pyproject.toml ./
 # This layer is cached unless pyproject.toml changes
 RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir .
 
-# Copy the startup script and make it executable
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Remove the dependency file
+RUN rm -rf pyproject.toml
 
-# Set the entrypoint script to run on container start
-ENTRYPOINT ["/entrypoint.sh"]
+# Clone TabulaPrima
+RUN git clone https://github.com/JordanRL/TabulaPrima.git /workspace/TabulaPrima
 
-# Define the *default* command to run AFTER the entrypoint finishes.
-# If the entrypoint script uses 'exec' at the end, this CMD is ignored.
-# If the entrypoint script finishes without 'exec', this CMD runs.
-# We can make it just start a bash shell so you can run train.py manually.
+# Run and start the pod
 CMD ["/start.sh"]

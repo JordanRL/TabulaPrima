@@ -1,8 +1,6 @@
 import logging
 import math
 import datetime
-import pickle
-import hashlib
 import traceback
 from traceback import FrameSummary
 from typing import Optional, Dict, Any, List
@@ -13,324 +11,18 @@ import torch
 from hydra.utils import to_absolute_path
 from omegaconf import OmegaConf
 from torch.optim import Optimizer
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
 import os
 import time
-from tqdm import tqdm
 import wandb
 from datasets import load_dataset
 
-from config_schema import Config
+from config_schema import Config, DatasetType
 from console import Colors, TPConsole
 from model_arch import MLATransformer
 from trainer import Trainer
-
-# Training Dataset
-class TextDataset(Dataset):
-    def __init__(self, file_path, tokenizer, max_length):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.examples = []
-
-        # Load and tokenize data
-        with open(file_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-
-        # Tokenize the full text
-        tokens = tokenizer.encode(text)
-
-        # Create examples with max_length tokens
-        for i in range(0, len(tokens) - max_length, max_length // 2):  # 50% overlap
-            self.examples.append(tokens[i:i + max_length])
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        tokens = self.examples[idx]
-        return {
-            'input_ids': torch.tensor(tokens[:-1]),
-            'labels': torch.tensor(tokens[1:])
-        }
-
-
-class HFDataset(Dataset):
-    def __init__(self, tokenizer, dataset_path, seq_length, dataset_name=None, split="train"):
-        """
-        Initialize the dataset from Hugging Face.
-
-        Args:
-            tokenizer: Tokenizer to use for encoding text
-            dataset_path: Dataset path (e.g., "wikitext")
-            dataset_name: Dataset name (e.g., "wikitext-2-raw-v1")
-            seq_length: Maximum sequence length
-            split: Either "train" or "test"
-        """
-        self.tokenizer = tokenizer
-        self.seq_length = seq_length
-
-        print(Colors.header(f"{'=' * 50}"))
-        print(Colors.header(f" Loading {split.upper()} Dataset: {dataset_path}/{dataset_name or ''}"))
-        print(Colors.header(f"{'=' * 50}"))
-
-        # Load dataset
-        self.raw_dataset = load_dataset(dataset_path, dataset_name, trust_remote_code=True)
-        self.split = split
-
-        # Process raw dataset to create examples
-        self.examples = []
-
-        # Process each text item individually to avoid exceeding max length
-        total_tokens = 0
-        skipped_short = 0
-        text_items = 0
-
-        # Progress bar for dataset processing
-        texts = self.raw_dataset[split]["text"]
-        for text in tqdm(texts, desc=f"Processing {split} texts", unit="text"):
-            if not text.strip():
-                continue
-
-            text_items += 1
-            # Tokenize the current text item
-            encodings = tokenizer(text, return_tensors="pt", truncation=False)
-            input_ids = encodings.input_ids[0]
-            total_tokens += len(input_ids)
-
-            # Skip if this text is too short
-            if len(input_ids) < 4:  # Need at least a few tokens
-                skipped_short += 1
-                continue
-
-            # Split into examples with stride
-            for i in range(0, max(1, len(input_ids) - seq_length), seq_length // 2):
-                end_idx = min(i + seq_length, len(input_ids))
-                if end_idx - i < seq_length // 4:  # Skip if too short
-                    continue
-
-                # Get the example with consistent length whenever possible
-                if end_idx - i == seq_length:
-                    # Full-length example, just clone it
-                    self.examples.append(input_ids[i:end_idx].clone())
-                else:
-                    # This example is at the end of the text and shorter than seq_length
-                    example = input_ids[i:end_idx].clone()
-                    # Ensure all examples have at least 4 tokens for training
-                    if len(example) >= 4:
-                        self.examples.append(example)
-
-        # Ensure we have at least one example
-        if len(self.examples) == 0:
-            print(Colors.error(f"Warning: No examples found in {split} set, creating a dummy example"))
-            self.examples.append(torch.tensor([tokenizer.bos_token_id, tokenizer.eos_token_id]))
-
-        self.total_tokens = total_tokens
-
-        # Print summary information
-        print(Colors.success(f"» Loaded {split} dataset:"))
-        print(Colors.info(f"» Dataset: {dataset_path}/{dataset_name or ''}"))
-        print(Colors.info(f"» Text items processed: {text_items} (skipped {skipped_short} short items)"))
-        print(Colors.info(f"» Training examples: {Colors.highlight(f'{len(self.examples):,}')}"))
-        print(Colors.info(f"» Total tokens: {Colors.highlight(f'{total_tokens:,}')}"))
-        print(Colors.info(f"» Avg tokens per example: {total_tokens / max(1, len(self.examples)):.1f}"))
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        input_ids = self.examples[idx]
-
-        # Create inputs and labels for causal language modeling
-        # Input: all tokens except the last one
-        # Labels: all tokens except the first one
-        return {
-            "input_ids": input_ids[:-1],
-            "labels": input_ids[1:]
-        }
-
-
-class CachedHFDataset(Dataset):
-    def __init__(
-            self,
-            tokenizer: PreTrainedTokenizerFast,
-            dataset_path,
-            dataset_name=None,
-            seq_length=2048,
-            split="train",
-            cache_dir="dataset_cache"
-    ):
-        """
-        Initialize the dataset from Hugging Face with caching for tokenized examples.
-
-        Args:
-            tokenizer: Tokenizer to use for encoding text
-            dataset_path: Dataset path (e.g., "wikitext")
-            dataset_name: Dataset name (e.g., "wikitext-2-raw-v1")
-            seq_length: Maximum sequence length
-            split: Either "train" or "test"
-            cache_dir: Directory to store cached tokenized datasets
-        """
-        self.tokenizer = tokenizer
-        self.seq_length = seq_length
-        self.split = split
-        self.cache_dir = hydra.utils.to_absolute_path(cache_dir)
-        self.console = TPConsole()
-        self.total_raw_tokens = 0
-        self.total_tokens = 0
-        self.effective_total_tokens = 0
-
-        # Create a unique cache key based on tokenizer, dataset, and sequence length
-        # This ensures we regenerate cache if any of these change
-        tokenizer_name = tokenizer.__class__.__name__
-        if tokenizer_name == "PreTrainedTokenizerFast":
-            self.vocab_size = len(tokenizer)
-        else:
-            self.vocab_size = tokenizer.vocab_size
-        cache_key = f"{tokenizer_name}_{self.vocab_size}_{dataset_path}_{dataset_name or ''}_{split}_{seq_length}"
-        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
-        self.cache_file = os.path.join(self.cache_dir, f"{cache_hash}.pkl")
-
-        self.console.rule(Colors.highlight(f"Dataset: {dataset_path}/{dataset_name or ''} ({split})"),
-                          style=Colors.HEADER)
-
-        # Try to load from cache first
-        self.examples = self._load_from_cache()
-        was_cached = self._was_cached()
-
-        # If not in cache, process the dataset and save to cache
-        if self.examples is None:
-            from datasets import load_dataset
-
-            self.console.print(Colors.info(f"Cache miss. Loading and tokenizing dataset..."))
-            self.raw_dataset = load_dataset(dataset_path, dataset_name, trust_remote_code=True)
-            self.examples = []
-
-            # Process each text item to create examples
-            skipped_short = 0
-            skipped_long = 0
-            text_items = 0
-
-            # Progress bar for dataset processing
-            texts = self.raw_dataset[split]["text"]
-
-            self.console.create_progress_task("dataset", task_desc=f"Tokenizing {split} dataset", total=len(texts))
-            for text in texts:
-                self.console.update_progress_task("dataset", advance=1)
-                if not text.strip():
-                    continue
-
-                text_items += 1
-                # Tokenize the current text item
-                if tokenizer_name == "PreTrainedTokenizerFast":
-                    encodings = tokenizer(text, return_tensors="pt", truncation=False, max_length=None)
-                    input_ids = encodings.input_ids[0]
-                else:
-                    input_ids = torch.tensor(tokenizer.encode(text), dtype=torch.long)
-                self.total_tokens += len(input_ids)
-
-                if len(input_ids) > self.seq_length:
-                    skipped_long += 1
-                    continue
-
-                # Skip if this text is too short
-                if len(input_ids) < 4:  # Need at least a few tokens
-                    skipped_short += 1
-                    continue
-
-                # Split into examples with stride
-                for i in range(0, max(1, len(input_ids) - seq_length), seq_length // 2):
-                    end_idx = min(i + seq_length, len(input_ids))
-                    if end_idx - i < seq_length // 4:  # Skip if too short
-                        continue
-
-                    self.effective_total_tokens += len(input_ids)
-                    # Get the example with consistent length whenever possible
-                    if end_idx - i == seq_length:
-                        # Full-length example, just clone it
-                        self.examples.append(input_ids[i:end_idx].clone())
-                    else:
-                        # This example is at the end of the text and shorter than seq_length
-                        example = input_ids[i:end_idx].clone()
-                        # Ensure all examples have at least 4 tokens for training
-                        if len(example) >= 4:
-                            self.examples.append(example)
-
-            # Ensure we have at least one example
-            if len(self.examples) == 0:
-                self.console.print(f"Warning: No examples found in {split} set, creating a dummy example")
-                self.examples.append(torch.tensor([tokenizer.bos_token_id, tokenizer.eos_token_id]))
-
-            self.console.remove_progress_task("dataset")
-
-            # Save processed examples to cache
-            self._save_to_cache()
-
-        # Print summary information
-        summary = [
-            {"title": "Dataset", "content": dataset_path+"/"+dataset_name},
-            {"title": "Split", "content": split},
-            {"title": "Examples", "content": f"{len(self.examples):,}"},
-            {"title": "Sequence length", "content": seq_length}
-        ]
-        if hasattr(self, "total_tokens"):
-            summary.append({"title": "Total raw tokens", "content": f"{self.total_tokens:,}"})
-        if hasattr(self, 'effective_total_tokens'):
-            summary.append({"title": "Total effective tokens", "content": f"{self.effective_total_tokens:,}"})
-            summary.append({"title": "Avg tokens per example", "content": f"{self.effective_total_tokens / max(1, len(self.examples)):.2f}"})
-
-        self.console.print_list(summary)
-
-    def _load_from_cache(self):
-        """Try to load the dataset from cache file"""
-        if not os.path.exists(self.cache_dir):
-            os.makedirs(self.cache_dir, exist_ok=True)
-            return None
-
-        if os.path.exists(self.cache_file):
-            try:
-                self.console.print_notification(f"Loading cached dataset from {Colors.header(self.cache_file)}")
-                with open(self.cache_file, 'rb') as f:
-                    cache_data = pickle.load(f)
-                    self.total_tokens = cache_data['total_tokens']
-                    self.effective_total_tokens = cache_data['effective_total_tokens']
-                    return cache_data['examples']
-            except Exception as e:
-                self.console.print_error(f"Error loading cache: {e}")
-                return None
-        return None
-
-    def _save_to_cache(self):
-        """Save the processed dataset to cache file"""
-        if not os.path.exists(self.cache_dir):
-            os.makedirs(self.cache_dir, exist_ok=True)
-
-        self.console.print_notification(f"Saving dataset to cache at {Colors.header(self.cache_file)}")
-        with open(self.cache_file, 'wb') as f:
-            cache_data = {
-                'examples': self.examples,
-                'total_tokens': self.total_tokens,
-                'effective_total_tokens': self.effective_total_tokens
-            }
-            pickle.dump(cache_data, f)
-
-    def _was_cached(self):
-        """Check if dataset was loaded from cache"""
-        return os.path.exists(self.cache_file)
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        input_ids = self.examples[idx]
-
-        # Create inputs and labels for causal language modeling
-        # Input: all tokens except the last one
-        # Labels: all tokens except the first one
-        return {
-            "input_ids": input_ids[:-1],
-            "labels": input_ids[1:]
-        }
+from dataset.datasets import CachedHFDataset, HFDataset
 
 
 class TokenBasedCosineLRScheduler:
@@ -391,12 +83,14 @@ class TokenBasedCosineLRScheduler:
             if not isinstance(warmup_ratio, float) or not (0.0 <= warmup_ratio <= 1.0):
                 raise ValueError("warmup_ratio must be a float between 0.0 and 1.0.")
             self._warmup_tokens = int(warmup_ratio * target_total_tokens)
+            self._warmup_ratio = warmup_ratio
         else:
             if not isinstance(warmup_tokens, int) or warmup_tokens < 0:
                 raise ValueError("warmup_tokens must be a non-negative integer.")
             if warmup_tokens > target_total_tokens:
                 raise ValueError("warmup_tokens cannot be greater than target_total_tokens.")
             self._warmup_tokens = warmup_tokens
+            self._warmup_ratio = warmup_tokens / target_total_tokens
 
         self.optimizer = optimizer
         self.target_total_tokens = target_total_tokens
@@ -453,6 +147,10 @@ class TokenBasedCosineLRScheduler:
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
 
+    def get_warmup_ratio(self):
+        """Returns the ratio of warmup phase to total training phase."""
+        return self._warmup_ratio
+
     def step(self, tokens_processed_so_far: int):
         """
         Updates the scheduler's state and the optimizer's learning rate based
@@ -476,6 +174,30 @@ class TokenBasedCosineLRScheduler:
             return []
         return [self.optimizer.param_groups[0]['lr']]  # Return list for consistency
 
+    def state_dict(self):
+        return {
+            "target_total_tokens": self.target_total_tokens,
+            "max_lr": self.max_lr,
+            "min_lr": self.min_lr,
+            "_warmup_tokens": self._warmup_tokens,
+            "_current_tokens": self._current_tokens,
+            "_last_lr": self.get_last_lr()[0],
+        }
+
+    @classmethod
+    def from_state_dict(cls, state_dict, optimizer):
+        scheduler = cls(
+            optimizer=optimizer,
+            target_total_tokens=state_dict["target_total_tokens"],
+            max_lr=state_dict["max_lr"],
+            min_lr=state_dict["min_lr"],
+            warmup_tokens=state_dict["_warmup_tokens"],
+            warmup_ratio=None,
+        )
+        scheduler._current_tokens = state_dict["_current_tokens"]
+        scheduler._set_lr(state_dict["_last_lr"])
+        return scheduler
+
     def __repr__(self) -> str:
         return (f"{self.__class__.__name__}("
                 f"target_total_tokens={self.target_total_tokens}, "
@@ -489,46 +211,13 @@ def run_training(cfg: Config):
 
     if not os.path.exists(cfg.training.checkpoint_dir):
         os.makedirs(cfg.training.checkpoint_dir, exist_ok=True)
-    if not os.path.exists('models'):
-        os.makedirs('models', exist_ok=True)
+    if not os.path.exists(cfg.training.model_dir):
+        os.makedirs(cfg.training.model_dir, exist_ok=True)
 
     training_console.section("Datasets and Hardware")
 
-    def display_frame_info(frame_info: FrameSummary):
-        training_console.print(Colors.info(f"  File: {Colors.highlight(frame_info.filename)}"))
-        training_console.print(Colors.info(f"  Line: {Colors.highlight(frame_info.lineno)}"))
-        training_console.print(Colors.info(f"  Function: {Colors.highlight(frame_info.name)}"))
-        training_console.print(
-            Colors.info(f"  Code: {Colors.highlight(frame_info.line.strip() if frame_info.line else 'N/A')}"))
-
-    def display_exception(exception: Exception, msg: str = "❌ Training failed with error"):
-        training_console.progress_stop()
-        if cfg.use_live_display:
-            training_console.print(Colors.error(f"\n{msg}: {exception}"))
-            tb = exception.__traceback__
-            if tb:
-                stack_summary = traceback.extract_tb(tb)
-                training_console.print(f"\nFull stack depth: {len(stack_summary)}")
-
-                if len(stack_summary) > 0:
-                    training_console.print(Colors.error(f"\n  ⓘ Outermost Frame (Frame 0):"))
-                    frame = stack_summary[0]
-                    display_frame_info(frame)
-
-                if len(stack_summary) > 1:
-                    training_console.print(Colors.error(f"\n  ⓘ Caller of Error Function (Frame -2):"))
-                    frame = stack_summary[-2]
-                    display_frame_info(frame)
-
-                if len(stack_summary) > 0:
-                    training_console.print(Colors.error(f"\n  ⓘ Error Location (Frame -1):"))
-                    frame = stack_summary[-1]
-                    display_frame_info(frame)
-        else:
-            training_console.handle_exception()
-
     # Handle cache directory
-    if cfg.dataset.clear_cache and os.path.exists(to_absolute_path(cfg.dataset.cache_dir)):
+    if cfg.dataset.dataset_type == DatasetType.CACHED and cfg.dataset.clear_cache and os.path.exists(to_absolute_path(cfg.dataset.cache_dir)):
         training_console.print_warning(f"Clearing cache directory: {cfg.dataset.cache_dir}")
         for file in os.listdir(to_absolute_path(cfg.dataset.cache_dir)):
             if file.endswith(".pkl"):
@@ -551,70 +240,65 @@ def run_training(cfg: Config):
     run_status = "setup"
 
     training_console.update_progress_task("application", advance=1, description="Loading Dataset")
-    try:
-        if cfg.dataset.no_cache:
-            train_dataset = HFDataset(
-                tokenizer=tokenizer,
-                dataset_path=cfg.dataset.name,
-                dataset_name=cfg.dataset.subset,
-                seq_length=cfg.dataset.seq_length,
-                split="train"
-            )
+    training_console.rule(f"Dataset Preparation")
+    if cfg.dataset.dataset_type == DatasetType.HF:
+        train_dataset = HFDataset(
+            tokenizer=tokenizer,
+            dataset_path=cfg.dataset.name,
+            dataset_name=cfg.dataset.subset,
+            seq_length=cfg.dataset.seq_length,
+            split="train"
+        )
 
-            test_dataset = HFDataset(
-                tokenizer=tokenizer,
-                dataset_path=cfg.dataset.name,
-                dataset_name=cfg.dataset.subset,
-                seq_length=cfg.dataset.seq_length,
-                split="test"
-            )
-        elif cfg.dataset.stream_dataset:
-            def tokenize_example(batch: Dict[str, list]) -> Dict[str, list]:
-                encoded_texts = tokenizer.encode_batch(batch["text"])
-                return {
-                    "input_ids": encoded_texts
-                }
-            training_console.print_notification("Initializing streaming dataset")
-            core_dataset = load_dataset(
-                path=cfg.dataset.name,
-                name=cfg.dataset.subset,
-                split="train",
-                streaming=True,
-                trust_remote_code=True,
-                cache_dir=cfg.dataset.cache_dir
-            )
-            core_dataset = core_dataset.map(tokenize_example, batched=True)
-            core_dataset = core_dataset.shuffle(seed=1240, buffer_size=10000)
-            training_console.print_complete("Streaming dataset initialized")
+        test_dataset = HFDataset(
+            tokenizer=tokenizer,
+            dataset_path=cfg.dataset.name,
+            dataset_name=cfg.dataset.subset,
+            seq_length=cfg.dataset.seq_length,
+            split="test"
+        )
+    elif cfg.dataset.dataset_type == DatasetType.STREAMING:
+        def tokenize_example(batch: Dict[str, list]) -> Dict[str, list]:
+            encoded_texts = tokenizer.encode_batch(batch["text"])
+            return {
+                "input_ids": encoded_texts
+            }
+        training_console.print_notification("Initializing streaming dataset")
+        core_dataset = load_dataset(
+            path=cfg.dataset.name,
+            name=cfg.dataset.subset,
+            split="train",
+            streaming=True,
+            trust_remote_code=True,
+            cache_dir=cfg.dataset.cache_dir
+        )
+        core_dataset = core_dataset.map(tokenize_example, batched=True)
+        core_dataset = core_dataset.shuffle(seed=1240, buffer_size=10000)
+        training_console.print_complete("Streaming dataset initialized")
 
-            training_console.print_notification("Splitting streaming dataset into train and test sets")
-            test_dataset = core_dataset.take(cfg.training.eval_split_size)
-            train_dataset = core_dataset.skip(cfg.training.eval_split_size)
-            training_console.print_complete("Split finished, dataset ready to train")
-        else:
-            # Use the cached dataset implementation
-            train_dataset = CachedHFDataset(
-                tokenizer=tokenizer,
-                dataset_path=cfg.dataset.name,
-                dataset_name=cfg.dataset.subset,
-                seq_length=cfg.dataset.seq_length,
-                split="train",
-                cache_dir=cfg.dataset.cache_dir
-            )
+        training_console.print_notification("Splitting streaming dataset into train and test sets")
+        test_dataset = core_dataset.take(cfg.training.eval_split_size)
+        train_dataset = core_dataset.skip(cfg.training.eval_split_size)
+        training_console.print_complete("Split finished, dataset ready to train")
+    else:
+        # Use the cached dataset implementation
+        train_dataset = CachedHFDataset(
+            tokenizer=tokenizer,
+            dataset_path=cfg.dataset.name,
+            dataset_name=cfg.dataset.subset,
+            seq_length=cfg.dataset.seq_length,
+            split="train",
+            cache_dir=cfg.dataset.cache_dir
+        )
 
-            test_dataset = CachedHFDataset(
-                tokenizer=tokenizer,
-                dataset_path=cfg.dataset.name,
-                dataset_name=cfg.dataset.subset,
-                seq_length=cfg.dataset.seq_length,
-                split="test",
-                cache_dir=cfg.dataset.cache_dir
-            )
-    except Exception as e:
-        display_exception(exception=e, msg="💥 Error processing datasets")
-        run_status = "failed"
-        train_dataset = None
-        test_dataset = None
+        test_dataset = CachedHFDataset(
+            tokenizer=tokenizer,
+            dataset_path=cfg.dataset.name,
+            dataset_name=cfg.dataset.subset,
+            seq_length=cfg.dataset.seq_length,
+            split="test",
+            cache_dir=cfg.dataset.cache_dir
+        )
 
     # Define a collate function to handle variable length sequences
     def collate_fn(collate_batch):
@@ -743,149 +427,171 @@ def run_training(cfg: Config):
         }
 
     training_console.update_progress_task("application", advance=1, description="Creating Data Loaders")
-    try:
-        if run_status == "setup":
-            # Create data loaders
-            if cfg.dataset.stream_dataset:
-                train_dataloader = DataLoader(
-                    train_dataset,
-                    batch_size=cfg.training.batch_size,
-                    num_workers=cfg.dataset.num_workers,
-                    collate_fn=collate_fn_stream,
-                    prefetch_factor=4
-                )
+    if run_status == "setup":
+        training_console.subrule("Data Loaders")
+        # Create data loaders
+        if cfg.dataset.dataset_type == DatasetType.STREAMING:
+            train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=cfg.training.batch_size,
+                num_workers=cfg.dataset.num_workers,
+                collate_fn=collate_fn_stream,
+                prefetch_factor=4
+            )
+            training_console.print_complete("Train Split Data Loader Created")
 
-                test_dataloader = DataLoader(
-                    test_dataset,
-                    batch_size=1,
-                    num_workers=2,
-                    collate_fn=collate_fn_stream
-                )
-            else:
-                train_dataloader = DataLoader(
-                    train_dataset,
-                    batch_size=cfg.training.batch_size,
-                    shuffle=True,
-                    num_workers=cfg.dataset.num_workers,
-                    collate_fn=collate_fn
-                )
-
-                test_dataloader = DataLoader(
-                    test_dataset,
-                    batch_size=1,
-                    shuffle=False,
-                    num_workers=2,
-                    collate_fn=collate_fn
-                )
+            test_dataloader = DataLoader(
+                test_dataset,
+                batch_size=1,
+                num_workers=2,
+                collate_fn=collate_fn_stream
+            )
+            training_console.print_complete("Test Split Data Loader Created")
         else:
-            training_console.print(Colors.warning(f"🚫 Data loaders skipped due to previous error"))
-            train_dataloader = None
-            test_dataloader = None
-    except Exception as e:
-        display_exception(exception=e, msg="💥 Error creating data loaders")
-        run_status = "failed"
+            train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=cfg.training.batch_size,
+                shuffle=True,
+                num_workers=cfg.dataset.num_workers,
+                collate_fn=collate_fn
+            )
+            training_console.print_complete("Train Split Data Loader Created")
+
+            test_dataloader = DataLoader(
+                test_dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=2,
+                collate_fn=collate_fn
+            )
+            training_console.print_complete("Test Split Data Loader Created")
+    else:
+        training_console.print_warning("🚫 Data loaders skipped due to previous error")
         train_dataloader = None
         test_dataloader = None
 
     training_console.update_progress_task("application", advance=1, description="Device Inspection")
-    try:
-        if run_status == "setup":
-            # Initialize model
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if run_status == "setup":
+        # Initialize model
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-            # Print GPU info
-            training_console.rule(Colors.highlight("Hardware Configuration"), style=Colors.HEADER)
+        # Print GPU info
+        training_console.rule("Hardware Inspection")
 
+        if torch.cuda.is_available():
+            #training_console.print_list_item("Number of GPUs", str(torch.cuda.device_count()))
+            training_console.print_list_item("Supports CUDA", Colors.success("Yes") if torch.cuda.is_available() else Colors.error("No"))
             if torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
-                total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-                training_console.print(Colors.success(f"» GPU detected: {Colors.highlight(gpu_name)}"))
-                training_console.print(Colors.info(f"» Total VRAM: {Colors.highlight(f'{total_vram:.2f} GB')}"))
-            else:
-                training_console.print(Colors.warning("⚠ No GPU detected! Training will be very slow on CPU."))
-
-            training_console.section("Model Configuration")
-
-            training_console.update_progress_task("application", advance=1, description="Model Initialization")
-            # Create model instance
-            vocab_size = tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else 50257
-            if cfg.float_32_precision is not None:
-                torch.set_float32_matmul_precision(cfg.float_32_precision)
-            model: MLATransformer|None = hydra.utils.instantiate(
-                cfg.model,
-                vocab_size=vocab_size,
-            )
-            model.to(device)
-            # Compile with torch.compile() for better kernel fusion
-            if cfg.training.compile_model:
-                training_console.rule(Colors.highlight("Model Compilation"), style=Colors.HEADER)
-                torch._logging.set_logs(inductor=logging.ERROR)
-                training_console.print_notification("Compiling model with torch.compile()")
-                model = torch.compile(model, backend="inductor", mode="default")
-                training_console.print_complete("Model compiled successfully")
-                training_console.print_notification("Model warmup with a single forward pass")
-                dummy = torch.randint(0, vocab_size, (cfg.training.batch_size, cfg.dataset.seq_length), device=device, dtype=torch.long)
-                _ = model(dummy)
-                training_console.print_complete("Model warmup complete")
+                device_properties = torch.cuda.get_device_properties()
+                total_vram = device_properties.total_memory / (1024 ** 3)
+                training_console.print_list_item("GPU Name", device_properties.name)
+                training_console.print_list_item("Architecture Name", device_properties.gcnArchName)
+                training_console.print_list_item("Total VRAM", f"{total_vram:.2f} GB")
+                if torch.cuda.is_bf16_supported():
+                    if torch.cuda.is_bf16_supported(False):
+                        bf16_support = Colors.success("Yes")
+                    else:
+                        bf16_support = Colors.warning("With Emulation")
+                else:
+                    bf16_support = Colors.error("No")
+                training_console.print_list_item("Supports BF16", bf16_support)
+                training_console.print_list_item("CUDA Capability", f"{device_properties.major}.{device_properties.minor}")
+                training_console.print_list_item("GPU Cores", f"{device_properties.multi_processor_count}")
+                training_console.print_list_item("Threads Per GPU Core", f"{device_properties.max_threads_per_multi_processor}")
         else:
-            training_console.print(Colors.warning(f"🚫 Model configuration skipped due to previous error"))
-            model = None
-            device = None
-    except Exception as e:
-        display_exception(exception=e, msg="❌ Unable to load model")
-        run_status = "failed"
+            training_console.print_warning("⚠ No GPU detected! Training will be very slow on CPU.")
+
+        training_console.section("Model Configuration")
+
+        training_console.rule(f"Model Name: {Colors.highlight(cfg.model.name)}")
+
+        training_console.update_progress_task("application", advance=1, description="Model Initialization")
+        training_console.subrule("Model Initialization")
+        # Create model instance
+        vocab_size = tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else 50257
+        if cfg.float_32_precision is not None:
+            torch.set_float32_matmul_precision(cfg.float_32_precision)
+            training_console.print_complete(f"Float32 MatMul Precision Set to {Colors.highlight(cfg.float_32_precision.title())}")
+        training_console.print_notification("Creating model instance")
+        model: MLATransformer|None = MLATransformer(
+            vocab_size=vocab_size,
+            hidden_dim=cfg.model.hidden_dim,
+            num_layers=cfg.model.num_layers,
+            num_heads=cfg.model.num_heads,
+            ff_dim=cfg.model.ff_dim,
+            kv_latent_dim=cfg.model.kv_latent_dim,
+            q_latent_dim=cfg.model.q_latent_dim,
+            dropout=cfg.model.dropout,
+            max_seq_len=cfg.dataset.seq_length,
+            rope_head_dim=cfg.model.rope_head_dim,
+            use_gradient_checkpointing=cfg.model.use_gradient_checkpointing,
+            use_fusion=cfg.model.use_fusion,
+        )
+        model.to(device)
+        training_console.print_complete(f"Model instance created and stored on device {device}")
+        # Compile with torch.compile() for better kernel fusion
+        if cfg.training.compile_model:
+            training_console.subrule("Model Compilation")
+            torch._logging.set_logs(inductor=logging.ERROR)
+            training_console.print_notification("Compiling model with torch.compile()")
+            model = torch.compile(model, backend="inductor", mode="default")
+            training_console.print_complete("Model compiled successfully")
+            training_console.print_notification("Model warmup with a single forward pass")
+            dummy = torch.randint(0, vocab_size, (cfg.training.batch_size, cfg.dataset.seq_length), device=device, dtype=torch.long)
+            _ = model(dummy)
+            training_console.print_complete("Model warmup complete")
+    else:
+        training_console.update_progress_task("application", advance=1, description="Model Initialization")
+        training_console.print_warning(f"🚫 Model configuration skipped due to previous error")
         model = None
         device = None
 
-    try:
-        if run_status == "setup":
-            # Track model parameters and memory usage
-            total_params = sum(p.numel() for p in model.parameters())
-            param_size_mb = total_params * 4 / (1024 ** 2)
+    training_console.update_progress_task("application", advance=1, description="Model Summary")
+    if run_status == "setup":
+        # Track model parameters and memory usage
+        total_params = sum(p.numel() for p in model.parameters())
+        param_size_mb = total_params * 4 / (1024 ** 2)
 
-            training_console.rule(Colors.highlight("Model Settings Summary"), style=Colors.HEADER)
-            training_console.print(Colors.info(f"» Architecture: Multi-head Latent Attention Transformer"))
-            training_console.print(Colors.info(f"» Hidden dimension: {Colors.highlight(cfg.model.hidden_dim)}"))
-            training_console.print(Colors.info(f"» Attention heads: {Colors.highlight(cfg.model.num_heads)}"))
-            training_console.print(Colors.info(f"» Layers: {Colors.highlight(cfg.model.num_layers)}"))
-            training_console.print(Colors.info(f"» Head dimension: {Colors.highlight(cfg.model.hidden_dim // cfg.model.num_heads)}"))
-            training_console.print(Colors.info(f"» RoPE head dimension: {Colors.highlight(cfg.model.rope_head_dim)}"))
-            training_console.print(Colors.info(f"» Compressed head dimension: {Colors.highlight((cfg.model.hidden_dim // cfg.model.num_heads) - cfg.model.rope_head_dim)}"))
-            training_console.print(Colors.info(f"» Key/Value Latent dimension: {Colors.highlight(cfg.model.kv_latent_dim)}"))
-            training_console.print(Colors.info(f"» Query Latent dimension: {Colors.highlight(cfg.model.q_latent_dim)}"))
-            training_console.print(Colors.info(f"» Feed-forward dimension: {Colors.highlight(cfg.model.ff_dim)}"))
-            training_console.print(Colors.info(f"» Parameters: {Colors.highlight(f'{total_params:,}')}"))
-            training_console.print(Colors.info(f"» Model disk size: {Colors.highlight(f'{param_size_mb:.2f} MB')}"))
+        training_console.rule("Model Settings Summary")
+        training_console.print_list_item("Architecture", "Multi-head Latent Attention Transformer")
+        training_console.print_list_item("Hidden dimension", f"{cfg.model.hidden_dim}")
+        training_console.print_list_item("Attention heads", f"{cfg.model.num_heads}")
+        training_console.print_list_item("Layers", f"{cfg.model.num_layers}")
+        training_console.print_list_item("Head dimension", f"{cfg.model.hidden_dim // cfg.model.num_heads}")
+        training_console.print_list_item("RoPE head dimension", f"{cfg.model.rope_head_dim}")
+        training_console.print_list_item("Compressed head dimension", f"{(cfg.model.hidden_dim // cfg.model.num_heads - cfg.model.rope_head_dim)}")
+        training_console.print_list_item("Key/Value Latent dimension", f"{cfg.model.kv_latent_dim}")
+        training_console.print_list_item("Query Latent dimension", f"{cfg.model.q_latent_dim}")
+        training_console.print_list_item("Feed-forward dimension", f"{cfg.model.ff_dim}")
+        training_console.print_list_item("Parameters", f"{total_params:,}")
+        training_console.print_list_item("Model disk size", f"{param_size_mb:.2f} MB")
 
-            training_console.section("Training Setup")
-            training_console.rule(Colors.highlight("Optimizer"), style=Colors.HEADER)
+        training_console.section("Training Setup")
+        training_console.update_progress_task("application", advance=1, description="Create Optimizer")
+        training_console.rule("Training Utilities")
+        training_console.subrule("Optimizer")
 
-            training_console.update_progress_task("application", advance=1, description="Model Initialization")
-            no_decay = ["bias", "LayerNorm.weight"]
-            optimizer_grouped_parameters = [
-                {
-                    "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-                    "weight_decay": cfg.training.weight_decay,
-                },
-                {
-                    "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-                    "weight_decay": 0.0,
-                },
-            ]
-            optimizer = torch.optim.AdamW(
-                optimizer_grouped_parameters,
-                lr=cfg.training.learning_rate,
-                weight_decay=cfg.training.weight_decay,
-                betas=(0.9, 0.95)
-            )
-            training_console.print_notification("Using regular AdamW optimizer")
-        else:
-            training_console.print(Colors.warning(f"🚫 Optimizer configuration skipped due to previous error"))
-            optimizer = None
-            total_params = 0
-    except Exception as e:
-        display_exception(exception=e, msg="❌ Unable to create optimizer")
-        run_status = "failed"
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": cfg.training.weight_decay,
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = torch.optim.AdamW(
+            optimizer_grouped_parameters,
+            lr=cfg.training.learning_rate,
+            weight_decay=cfg.training.weight_decay,
+            betas=(0.9, 0.95)
+        )
+        training_console.print_notification("Using regular AdamW optimizer")
+    else:
+        training_console.update_progress_task("application", advance=1, description="Create Optimizer")
+        training_console.print_warning("🚫 Optimizer configuration skipped due to previous error")
         optimizer = None
         total_params = 0
 
@@ -893,87 +599,84 @@ def run_training(cfg: Config):
         # Learning rate scheduler
         target_tokens = total_params * cfg.training.target_tokens_per_param
         training_console.update_progress_task("application", advance=1, description="Create Scheduler")
-        training_console.rule(Colors.highlight("Learning Rate Scheduler"), style=Colors.HEADER)
+        training_console.subrule("Learning Rate Scheduler")
         # Create scheduler
         scheduler: TokenBasedCosineLRScheduler|None = hydra.utils.instantiate(
             cfg.training.scheduler,
             optimizer=optimizer,
             target_total_tokens=target_tokens,
         )
-        training_console.print_notification("Using TokenBasedCosineLRScheduler")
+        training_console.print_notification(f"Using {Colors.header('TokenBasedCosineLRScheduler')}")
     else:
-        training_console.print(Colors.warning(f"🚫 Scheduler configuration skipped due to previous error"))
+        training_console.update_progress_task("application", advance=1, description="Create Scheduler")
+        training_console.print_warning("🚫 Scheduler configuration skipped due to previous error")
         scheduler = None
         target_tokens = 0
 
-    try:
-        if run_status == "setup":
-            training_console.update_progress_task("application", advance=1, description="W&B Initialization")
-            # Initialize wandb (optional)
-            training_console.rule(Colors.highlight("Instrumentation"), style=Colors.HEADER)
-            if cfg.training.wandb.log:
+    training_console.update_progress_task("application", advance=1, description="Instrumentation")
+    if run_status == "setup":
+        # Initialize wandb (optional)
+        training_console.subrule("Instrumentation")
+        if cfg.training.wandb.log:
 
-                run_name = f"{cfg.training.wandb.run_name}-{time.strftime('%b%d').upper()}"
+            run_name = f"{cfg.training.wandb.run_name}-{time.strftime('%b%d').upper()}"
 
-                wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
-                # Add runtime info not in static config
-                wandb_config['model']['parameters'] = total_params
-                wandb_config['training']['target_tokens'] = target_tokens
-                wandb_config['training']['effective_batch_size'] = cfg.training.batch_size * cfg.training.grad_steps
+            wandb_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+            # Add runtime info not in static config
+            wandb_config['model']['parameters'] = total_params
+            wandb_config['training']['target_tokens'] = target_tokens
+            wandb_config['training']['effective_batch_size'] = cfg.training.batch_size * cfg.training.grad_steps
 
-                if cfg.training.wandb.silent:
-                    os.environ["WANDB_SILENT"] = "true"
-                    os.environ["WANDB_CONSOLE"] = "off"
-                    logging.getLogger("wandb").setLevel(logging.ERROR)
-                    wandb_settings = wandb.Settings(console="off", silent=True, program_relpath="train.py")
-                    wandb.init(
-                        project=cfg.training.wandb.project,
-                        entity=cfg.training.wandb.entity,
-                        job_type="training",
-                        config=wandb_config,
-                        name=run_name,
-                        tags=cfg.training.wandb.tags,
-                        dir=".",
-                        settings=wandb_settings
-                    )
-                else:
-                    wandb.init(
-                        project=cfg.training.wandb.project,
-                        entity=cfg.training.wandb.entity,
-                        job_type="training",
-                        config=wandb_config,
-                        name=run_name,
-                        tags=cfg.training.wandb.tags,
-                        dir="."
-                    )
-                training_console.print_notification("W&B Initialized")
+            if cfg.training.wandb.silent:
+                os.environ["WANDB_SILENT"] = "true"
+                os.environ["WANDB_CONSOLE"] = "off"
+                logging.getLogger("wandb").setLevel(logging.ERROR)
+                wandb_settings = wandb.Settings(console="off", silent=True, program_relpath="train.py")
+                wandb.init(
+                    project=cfg.training.wandb.project,
+                    entity=cfg.training.wandb.entity,
+                    job_type="training",
+                    config=wandb_config,
+                    name=run_name,
+                    tags=cfg.training.wandb.tags,
+                    dir=".",
+                    settings=wandb_settings
+                )
             else:
-                training_console.print_warning("W&B disabled")
+                wandb.init(
+                    project=cfg.training.wandb.project,
+                    entity=cfg.training.wandb.entity,
+                    job_type="training",
+                    config=wandb_config,
+                    name=run_name,
+                    tags=cfg.training.wandb.tags,
+                    dir="."
+                )
+            training_console.print_notification("W&B Initialized")
         else:
-            training_console.print(Colors.warning(f"🚫 Scheduler configuration skipped due to previous error"))
-            scheduler = None
-    except Exception as e:
-        display_exception(exception=e, msg="❌ Unable to create scheduler")
-        run_status = "failed"
+            training_console.print_warning("W&B disabled")
+    else:
+        training_console.print(Colors.warning(f"🚫 Instrumentation configuration skipped due to previous error"))
         scheduler = None
 
-    training_console.rule(Colors.highlight("Training Settings Summary"), style=Colors.HEADER)
+    training_console.rule("Training Settings Summary")
     # Print training configuration
-    training_console.print(Colors.info(f"» Dataset: {Colors.highlight(f'{cfg.dataset.name}/{cfg.dataset.subset}')}"))
-    training_console.print(Colors.info(f"» Sequence Length: {Colors.highlight(cfg.dataset.seq_length)}"))
-    training_console.print(Colors.info(f"» Batch Size: {Colors.highlight(cfg.training.batch_size)} (effective: {Colors.highlight(cfg.training.batch_size * cfg.training.grad_steps)})"))
-    training_console.print(Colors.info(f"» Learning Rate: {Colors.highlight(cfg.training.learning_rate)}"))
-    training_console.print(Colors.info(f"» Using Cache: {Colors.highlight('No' if cfg.dataset.no_cache else 'Yes')}"))
-    training_console.print(Colors.info(f"» Gradient accumulation steps: {Colors.highlight(cfg.training.grad_steps)}"))
-    training_console.print(Colors.info(f"» Target training tokens: {Colors.highlight(f'{target_tokens:,}')}"))
+    training_console.print_list_item("Dataset", f"{f'{cfg.dataset.name}/{cfg.dataset.subset}'}")
+    training_console.print_list_item("Sequence Length", f"{cfg.dataset.seq_length}")
+    training_console.print_list_item("Batch Size", f"{cfg.training.batch_size} {Colors.info('(effective:')} {cfg.training.batch_size * cfg.training.grad_steps}{Colors.info(')')}")
+    training_console.print_list_item("Learning Rate", f"{cfg.training.learning_rate}")
+    training_console.print_list_item("Using Cache", f"{'No' if cfg.dataset.no_cache else 'Yes'}")
+    training_console.print_list_item("Gradient accumulation steps", f"{cfg.training.grad_steps}")
+    training_console.print_list_item("Target training tokens", f"{f'{target_tokens:,}'}")
 
     train_start_time = time.time()
 
     # Start training
+    training_exception = None
     try:
         if run_status == "setup":
             training_console.update_progress_task("application", advance=1, description="Training In Progress")
-            training_console.section("Model Training Progress")
+            training_console.section("Pre-Training Progress")
             trainer = Trainer(
                 model=model,
                 train_dataloader=train_dataloader,
@@ -981,25 +684,35 @@ def run_training(cfg: Config):
                 optimizer=optimizer,
                 scheduler=scheduler,
                 device=device,
-                wandb=wandb,
+                wandb_instance=wandb,
                 cfg=cfg.training,
             )
             trained_tokens, run_status = trainer.run_tokens(target_tokens)
-            if run_status == "failed":
+            if run_status == "failed" and cfg.training.wandb.log:
                 wandb.run.status = run_status
+            training_console.section("Training Completed")
         else:
-            training_console.print(Colors.warning(f"  🚫 Training skipped due to previous error"))
+            training_console.update_progress_task("application", advance=1, description="Training Skipped")
+            training_console.print_warning("🚫 Training skipped due to previous error")
     except KeyboardInterrupt:
+        training_console.section("Training Stopped")
         if training_console and training_console.has_progress_task("training"):
             # Attempt to remove the task from the display
             training_console.remove_progress_task("training")
-        training_console.print(Colors.warning("⚠ Training interrupted by user"))
-        wandb.alert(title="Training interrupted", text="Training interrupted by user")
-        wandb.run.status = run_status = "stopped"
+        training_console.print_warning("⚠ Training interrupted by user")
+        if cfg.training.wandb.log:
+            wandb.alert(title="Training interrupted", text="Training interrupted by user")
+            wandb.run.status = run_status = "stopped"
+        else:
+            run_status = "stopped"
     except Exception as e:
-        display_exception(exception=e, msg="❌ Training failed with error")
-        wandb.alert(title="Training failed", text=f"An error occurred during training: {e}")
-        wandb.run.status = run_status = "failed"
+        training_console.section("Training Failed")
+        if cfg.training.wandb.log:
+            wandb.alert(title="Training failed", text=f"An error occurred during training: {e}")
+            wandb.run.status = run_status = "failed"
+        else:
+            run_status = "failed"
+        training_exception = e
     finally:
         training_console.update_progress_task("application", advance=1, description="Final Metrics")
         # Calculate training statistics
@@ -1027,9 +740,17 @@ def run_training(cfg: Config):
             avg_tokens_per_second = 0
             tokens_per_parameter = 0
 
-        if wandb.run is not None:
+        if cfg.training.wandb.log and wandb.run is not None:
             if model:
                 # Log comprehensive run summary
+                columns = ["Metric", "Value"]
+                data = [
+                    ["Total Training Time", f"{total_training_hours:.2f} hours"],
+                    ["Average Tokens/Second", f"{avg_tokens_per_second:.2f}"],
+                    ["Total Tokens Processed", f"{total_tokens:,}"],
+                    ["Model Parameters", f"{sum(p.numel() for p in model.parameters()):,}"],
+                    ["GPU Utilization", f"{gpu_utilization:.1f}%"],
+                ]
                 wandb.log({
                     # Timing information
                     "run/total_time_seconds": total_training_time,
@@ -1048,43 +769,45 @@ def run_training(cfg: Config):
                     "run/gpu_name": gpu_name,
                     "run/gpu_memory_gb": memory_gb,
                     "run/gpu_utilization_pct": gpu_utilization,
-                    "run/memory_allocated_gb": torch.cuda.memory_allocated(device) / (
-                                1024 ** 3) if torch.cuda.is_available() else 0,
-                    "run/memory_reserved_gb": torch.cuda.memory_reserved(device) / (
-                                1024 ** 3) if torch.cuda.is_available() else 0,
+                    "run/memory_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0,
+                    "run/memory_reserved_gb": torch.cuda.memory_reserved(device) / (1024 ** 3) if torch.cuda.is_available() else 0,
+                    "run/summary_table": wandb.Table(columns=columns, data=data),
                 })
 
-                # Create a final summary table
-                if wandb.run is not None:
-                    columns = ["Metric", "Value"]
-                    data = [
-                        ["Total Training Time", f"{total_training_hours:.2f} hours"],
-                        ["Average Tokens/Second", f"{avg_tokens_per_second:.2f}"],
-                        ["Total Tokens Processed", f"{total_tokens:,}"],
-                        ["Model Parameters", f"{sum(p.numel() for p in model.parameters()):,}"],
-                        ["GPU Utilization", f"{gpu_utilization:.1f}%"],
-                    ]
-                    wandb.log({"run/summary_table": wandb.Table(columns=columns, data=data)})
+        training_console.rule("Clean Up")
+        # Save final model
+        if run_status != "failed":
+            training_console.subrule("Model Saving")
+            training_console.update_progress_task("application", advance=1, description="Saving Model")
+            training_console.print_notification("Saving final model")
+            final_model_path = os.path.join(cfg.training.model_dir, "final_model.pt")
+            torch.save(model, final_model_path)
+            training_console.print_complete(f"Model saved to {Colors.header(final_model_path)}")
+            if cfg.training.wandb.log and wandb.run is not None and cfg.training.wandb.save_final_model:
+                training_console.print_notification("Sending final model to W&B")
+                final_model_artifact = wandb.Artifact(name="final_model", type="model")
+                final_model_artifact.add_file(final_model_path)
+                wandb.run.log_artifact(final_model_artifact)
+                training_console.print_complete("Final model sent to W&B")
+        else:
+            training_console.update_progress_task("application", advance=1, description="Skipping Model Saving")
 
+        training_console.subrule("Shutting Down")
+        if cfg.training.wandb.log and wandb.run is not None:
             wandb.finish()
+            training_console.print_notification("W&B Closed Gracefully")
 
-    training_console.rule(Colors.highlight("Training completed"), style=Colors.HEADER)
-
-    # Save final model
-    if run_status != "failed":
-        training_console.update_progress_task("application", advance=1, description="Saving Model")
-        final_model_path = os.path.join("models", f"tabula_prima_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.pt")
-        torch.save(model, final_model_path)
-        training_console.print(Colors.success(f"✓ Saved final model to: {final_model_path}"))
-    else:
-        training_console.update_progress_task("application", advance=1, description="Skipping Model Saving")
-
-    if run_status == "failed":
-        training_console.print(Colors.error(f"❌ Training process experienced an error ❌"))
-    elif run_status == "stopped":
-        training_console.print(Colors.warning(f"🚫 Training process was stopped manually 🚫"))
-    elif run_status == "terminated":
-        training_console.print(Colors.warning(f"🛑 Training process was stopped automatically 🛑"))
-    else:
-        training_console.print(Colors.success(f"✨ Training process completed successfully ✨"))
-    training_console.update_progress_task("application", advance=1, description="Finished")
+        if run_status == "failed":
+            training_console.print_error("❌ Training process experienced an error ❌")
+        elif run_status == "stopped":
+            training_console.print_warning("🚫 Training process was stopped manually 🚫")
+        elif run_status == "terminated":
+            training_console.print_warning("🛑 Training process was stopped automatically 🛑")
+        else:
+            training_console.print_success("✨ Training process completed successfully ✨")
+        training_console.update_progress_task("application", completed=14, description="Finished")
+        training_console.progress_stop()
+        time.sleep(0.1)
+        training_console.end_live()
+        if training_exception is not None:
+            raise training_exception

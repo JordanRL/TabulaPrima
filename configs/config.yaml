@@ -3,13 +3,11 @@ defaults:
   - config_schema
   - _self_
   - model: 278m_params
-  - training: default
+  - training: 278m_params
   - dataset: wikitext
   - tokenizer: tiktoken
+  - console: with_live
 
-# Parameters that don't fit neatly into other groups (like args in train.py)
-use_live_display: true
-use_stats: true
 float_32_precision: highest
 
 # Define where Hydra should store outputs (logs, saved configs, checkpoints if not overridden)

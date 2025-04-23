@@ -6,18 +6,18 @@ defaults:
   - wandb: default
 
 # @package training
-batch_size: 4
-grad_steps: 8
+batch_size: 1
+grad_steps: 16
 dropout: 0.0
 learning_rate: 5e-5
 weight_decay: 0.01
 max_grad_norm: 1.0
 log_interval: 10
 eval_interval: 100
-eval_split_size: 500
+eval_split_size: ${dataset.eval_split_size}
 use_amp: false
-allow_amp_switchover: true
-use_checkpointing: false
+allow_amp_switchover: false
+use_gradient_checkpointing: false
 use_fusions: false
 compile_model: true
 target_tokens_per_param: 10
