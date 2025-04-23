@@ -681,7 +681,7 @@ def run_training(cfg: Config):
                 scheduler=scheduler,
                 device=device,
                 wandb_instance=wandb,
-                cfg=cfg.training,
+                cfg=cfg,
             )
             trained_tokens, run_status = trainer.run_tokens(target_tokens)
             if run_status == "failed" and cfg.training.wandb.log:

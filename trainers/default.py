@@ -7,16 +7,15 @@ import time
 import wandb
 from rich.align import Align
 from rich.console import Group
-from rich.layout import Layout
 from rich.text import Text
 
-from config_schema import TrainingConfig
+from config_schema import Config
 from console import TPConsole, Colors
 from .utils import TrainingState, TrainingPhases, EvaluationResult
 
 
 class Trainer:
-    cfg: TrainingConfig
+    cfg: Config
 
     def __init__(
             self,
@@ -53,18 +52,18 @@ class Trainer:
             stability_steps=0,
             stability_reached=False,
             checkpoint_interval=60 * 60 * 4,
-            use_amp=self.cfg.use_amp,
+            use_amp=self.cfg.training.use_amp,
             current_loss=float('inf'),
             current_perplexity=float('inf'),
             tokens_per_sec=0,
             epochs=0,
-            steps_per_instrument=self.cfg.log_interval,
-            steps_per_eval=self.cfg.eval_interval,
-            allow_amp_switchover=self.cfg.allow_amp_switchover,
-            steps_per_gradient_update=self.cfg.grad_steps,
+            steps_per_instrument=self.cfg.training.log_interval,
+            steps_per_eval=self.cfg.training.eval_interval,
+            allow_amp_switchover=self.cfg.training.allow_amp_switchover,
+            steps_per_gradient_update=self.cfg.training.grad_steps,
             tokens_per_batch=0,
-            use_time_based_instrument=self.cfg.wandb.use_time_based_instrument,
-            time_per_instrument=1/self.cfg.wandb.instruments_per_second if self.cfg.wandb.instruments_per_second != 0 else 1,
+            use_time_based_instrument=self.cfg.training.wandb.use_time_based_instrument,
+            time_per_instrument=1/self.cfg.training.wandb.instruments_per_second if self.cfg.training.wandb.instruments_per_second != 0 else 1,
             time_of_last_instrument=0,
             total_instrument_events=0,
             total_eval_events=0,
@@ -77,8 +76,21 @@ class Trainer:
         self.last_checkpoint_time = None
         self.start_time = None
         self.train_info_col = None
-        self.train_info_col_header = Align.center(Text.from_markup(f"{Colors.header('Train Info')}"))
+        self.train_info_col_header = Align.center(Text.from_markup(f"{Colors.header('Training Info')}"))
         self.console = TPConsole()
+        self.model_info_col = [
+            Align.center(Text.from_markup(f"{Colors.header('Model Info')}")),
+            Text.from_markup("\n\n" + "\n".join(self.console.print_list([
+                {"title": "Name", "content": self.cfg.model.name},
+                {"title": "Params", "content": f"{sum(p.numel() for p in model.parameters()):,}"},
+                {"title": "d_model", "content": f"{self.cfg.model.hidden_dim:,}"},
+                {"title": "d_ff", "content": f"{self.cfg.model.ff_dim:,}"},
+                {"title": "d_kv_latent", "content": f"{self.cfg.model.kv_latent_dim:,}"},
+                {"title": "d_q_latent", "content": f"{self.cfg.model.q_latent_dim:,}"},
+                {"title": "n_layers", "content": f"{self.cfg.model.num_layers:,}"},
+                {"title": "n_heads", "content": f"{self.cfg.model.num_heads:,}"},
+            ], True)) + "\n\n")
+        ]
 
     def state_dict(self):
         return {
@@ -119,15 +131,17 @@ class Trainer:
         return trainer
 
     def run_tokens(self, target_tokens):
-        self.console.new_main_content()
-        train_info_col = self.console.add_column_to_main(width=40)
+        if self.cfg.console.use_live_display:
+            self.console.new_main_content()
+            train_info_col = self.console.add_column_to_main(width=40)
 
-        self.train_info_col = train_info_col
+            self.train_info_col = train_info_col
 
-        self.console.update_column_content(train_info_col, Group(
-            self.train_info_col_header,
-            Text.from_markup("\n\n"+"\n".join(self.console.print_list(self.training_state.train_info_panel_content(), True)))
-        ))
+            self.console.update_column_content(train_info_col, Group(
+                *self.model_info_col,
+                self.train_info_col_header,
+                Text.from_markup("\n\n"+"\n".join(self.console.print_list(self.training_state.train_info_panel_content(), True)))
+            ))
 
         self.console.section("Pre-Training Progress")
         self.console.rule(f"Training for {Colors.highlight(f'{target_tokens:,}')} tokens")
@@ -161,13 +175,15 @@ class Trainer:
                 if not batch_result:
                     return self.training_state.tokens_seen, "failed"
 
-                self.console.update_column_content(train_info_col, Group(
-                    self.train_info_col_header,
-                    Text.from_markup("\n\n"+"\n".join(self.console.print_list(self.training_state.train_info_panel_content(), True)))
-                ))
+                if self.cfg.console.use_live_display:
+                    self.console.update_column_content(train_info_col, Group(
+                        *self.model_info_col,
+                        self.train_info_col_header,
+                        Text.from_markup("\n\n" + "\n".join(self.console.print_list(self.training_state.train_info_panel_content(), True)))
+                    ))
 
                 cli_interval = time.time() - last_cli_update_time
-                if cli_interval > self.cfg.update_interval:
+                if cli_interval > self.cfg.training.update_interval:
                     last_cli_update_time = time.time()
                     self.console.rule("Periodic Training Update Summary")
                     tokens_seen = self.training_state.tokens_seen - last_cli_update_tokens
@@ -222,7 +238,7 @@ class Trainer:
         self.console.rule(Colors.highlight(f"Saving Checkpoint"), style=Colors.HEADER)
 
         self.console.print_notification("Creating resumable checkpoint PyTorch model file")
-        checkpoint_path = os.path.join(self.cfg.checkpoint_dir, f"model_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.pt")
+        checkpoint_path = os.path.join(self.cfg.training.checkpoint_dir, f"model_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.pt")
         torch.save({
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -232,7 +248,7 @@ class Trainer:
             "wandb_run_id": self.wandb.run.id if self.wandb is not None else None,
         }, checkpoint_path)
         self.console.print_complete(f"Checkpoint saved to file {Colors.header(checkpoint_path)}")
-        if self.wandb is not None and self.cfg.wandb.log and self.cfg.wandb.save_checkpoints:
+        if self.wandb is not None and self.cfg.training.wandb.log and self.cfg.training.wandb.save_checkpoints:
             self.console.print_notification("Sending checkpoint to W&B")
             checkpoint_artifact = wandb.Artifact(name="checkpoints", type="model")
             checkpoint_artifact.add_file(checkpoint_path)
@@ -246,8 +262,8 @@ class Trainer:
         total_tokens = 0
         batch_counter = 0
 
-        if self.cfg.eval_split_size is not None:
-            self.console.create_progress_task("eval", "Evaluating", total=self.cfg.eval_split_size)
+        if self.cfg.training.eval_split_size is not None:
+            self.console.create_progress_task("eval", "Evaluating", total=self.cfg.training.eval_split_size)
         else:
             self.console.create_progress_task("eval", "Evaluating", total=len(self.test_dataloader))
 
@@ -363,7 +379,7 @@ class Trainer:
             attention_mask=self.attention_mask
         )
 
-        loss = loss / self.cfg.grad_steps
+        loss = loss / self.cfg.training.grad_steps
 
         if self.training_state.use_amp and self.scaler is not None:
             self.scaler.scale(loss).backward()
@@ -410,7 +426,7 @@ class Trainer:
             loss = torch.clamp(loss, max=20.0)
 
         # 3. More aggressive gradient clipping for initial steps
-        grad_clip_value = 0.5 if self.training_state.optimizer_steps < 10 else self.cfg.max_grad_norm
+        grad_clip_value = 0.5 if self.training_state.optimizer_steps < 10 else self.cfg.training.max_grad_norm
 
         # Calculate gradient norm
         pre_clip_grad_norm = 0.0
@@ -421,10 +437,10 @@ class Trainer:
 
         self.training_state.update_precision_mode(self.start_time, pre_clip_grad_norm, self.scheduler.get_warmup_ratio())
 
-        self.training_state.finish_batch(self.cfg.batch_size)
+        self.training_state.finish_batch(self.cfg.training.batch_size)
 
         # Update weights after accumulating gradients
-        if self.training_state.inference_steps % self.cfg.grad_steps == 0:
+        if self.training_state.inference_steps % self.cfg.training.grad_steps == 0:
             self.training_state.step_optimizer()
             self.training_state.increment_steps_since_instrument()
             self.training_state.increment_steps_since_eval()
@@ -442,20 +458,20 @@ class Trainer:
                     description=f"Phase: {self.training_state.run_phase.value.title()} ({precision_mode})"
                 )
 
-                if self.cfg.allow_amp_switchover and self.training_state.use_amp == False:
+                if self.cfg.training.allow_amp_switchover and self.training_state.use_amp == False:
                     self.training_state.use_amp = True
                     if precision_mode == "FP16":
                         self.scaler = torch.amp.GradScaler()
                     else:
                         self.scaler = None
 
-        self.training_state.update_metrics(actual_tokens_in_batch, loss.item() * self.cfg.grad_steps, self.cfg.batch_size)
+        self.training_state.update_metrics(actual_tokens_in_batch, loss.item() * self.cfg.training.grad_steps, self.cfg.training.batch_size)
 
         self.console.update_app_stats({
             "Tokens/s": f"{self.training_state.tokens_per_sec:08,.2f}",
             "Loss": f"{self.training_state.current_loss:.4f}",
             "Perplexity": f"{self.training_state.current_perplexity:,.2f}",
-            "Grad Norm": f"{sum(self.training_state.grad_norm_history[-self.cfg.grad_steps:]) / self.cfg.grad_steps:.4f}",
+            "Grad Norm": f"{sum(self.training_state.grad_norm_history[-self.cfg.training.grad_steps:]) / self.cfg.training.grad_steps:.4f}",
             "Learning Rate": f"{self.scheduler.get_last_lr()[0]:.4e}",
             "W&B Logs": f"{self.training_state.total_instrument_events:,}",
             "Evals": f"{self.training_state.total_eval_events:,}",
@@ -498,7 +514,7 @@ class Trainer:
         if eval_dict is not None:
             log_dict.update(eval_dict)
 
-        if len(log_dict) > 0 and self.cfg.wandb.log and self.wandb is not None:
+        if len(log_dict) > 0 and self.cfg.training.wandb.log and self.wandb is not None:
             self.wandb.log(log_dict)
 
         if (time.time() - self.last_checkpoint_time) >= self.training_state.checkpoint_interval:
