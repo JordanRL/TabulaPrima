@@ -479,7 +479,7 @@ def run_training(cfg: Config):
             #training_console.print_list_item("Number of GPUs", str(torch.cuda.device_count()))
             training_console.print_list_item("Supports CUDA", Colors.success("Yes") if torch.cuda.is_available() else Colors.error("No"))
             if torch.cuda.is_available():
-                device_properties = torch.cuda.get_device_properties()
+                device_properties = torch.cuda.get_device_properties(0)
                 total_vram = device_properties.total_memory / (1024 ** 3)
                 training_console.print_list_item("GPU Name", device_properties.name)
                 training_console.print_list_item("Architecture Name", device_properties.gcnArchName)
