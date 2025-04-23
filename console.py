@@ -7,8 +7,6 @@ from typing import Dict, Any, List, Literal, Union
 from zoneinfo import ZoneInfo
 
 import pyperclip
-from openpyxl.formatting.rule import RuleType
-from panel.viewable import Renderable
 from pyfiglet import Figlet
 from readchar import readkey, key
 from rich.align import Align
@@ -22,7 +20,6 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.style import Style
 from rich.table import Column
 from rich.text import Text
-from rich.measure import Measurement
 
 from config_schema import ConsoleConfig, TimeFormat
 
